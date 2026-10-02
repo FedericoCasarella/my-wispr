@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVFoundation
 import Speech
+import ServiceManagement
 @preconcurrency import ApplicationServices
 
 struct Usage: Codable, Identifiable {
@@ -12,6 +13,14 @@ struct Usage: Codable, Identifiable {
     let latency: Double
     let inserted: Bool
     var text: String? = nil
+}
+
+struct ShortcutBinding: Codable {
+    var keyCode: UInt16
+    var modifiers: UInt
+    var label: String
+    var isModifier: Bool
+    static let fn = ShortcutBinding(keyCode: 63, modifiers: 0, label: "fn", isModifier: true)
 }
 
 @MainActor
@@ -28,6 +37,29 @@ final class Dictation: ObservableObject {
     private var pressedAt = ContinuousClock.now
     private var heldShortcut = "fn"
     @Published var history: [Usage] = []
+    @Published var shortcut = (UserDefaults.standard.data(forKey: "shortcut").flatMap { try? JSONDecoder().decode(ShortcutBinding.self, from: $0) }) ?? .fn {
+        didSet { if let data = try? JSONEncoder().encode(shortcut) { UserDefaults.standard.set(data, forKey: "shortcut") } }
+    }
+    @Published var shortcutEnabled = UserDefaults.standard.object(forKey: "shortcutEnabled") as? Bool ?? true { didSet { UserDefaults.standard.set(shortcutEnabled, forKey: "shortcutEnabled") } }
+    @Published var soundEnabled = UserDefaults.standard.object(forKey: "soundEnabled") as? Bool ?? true { didSet { UserDefaults.standard.set(soundEnabled, forKey: "soundEnabled") } }
+    @Published var silenceSeconds = UserDefaults.standard.object(forKey: "silenceSeconds") as? Double ?? 10 { didSet { UserDefaults.standard.set(silenceSeconds, forKey: "silenceSeconds") } }
+    @Published var capturingShortcut = false
+    @Published private(set) var launchAtLogin = false
+    @Published private(set) var loginNeedsApproval = false
+    @Published private(set) var loginError: String?
+    func refreshLoginStatus() {
+        let status = SMAppService.mainApp.status
+        launchAtLogin = status == .enabled || status == .requiresApproval
+        loginNeedsApproval = status == .requiresApproval
+    }
+    func setLaunchAtLogin(_ enabled: Bool) {
+        loginError = nil
+        do {
+            if enabled { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+        } catch { loginError = "Impossibile aggiornare l’avvio al login: \(error.localizedDescription)" }
+        refreshLoginStatus()
+    }
     @Published var language = UserDefaults.standard.string(forKey: "language") ?? "it-IT"
     private let engine = AVAudioEngine()
     private let startSound: NSSound? = Bundle.main.url(forResource: "recording-start", withExtension: "wav").flatMap { NSSound(contentsOf: $0, byReference: false) }
@@ -58,6 +90,9 @@ final class Dictation: ObservableObject {
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var keyDown = false
+    private var fnChord = false
+    private var mediaTap: CFMachPort?
+    private var mediaSource: CFRunLoopSource?
     @Published private(set) var buttonRecording = false
     @Published var isStarting = false
     var showHUD: (() -> Void)?
@@ -75,25 +110,90 @@ final class Dictation: ObservableObject {
             Task { @MainActor in self?.refreshPermissions() }
         }
         prepareModel()
+        installMediaObserver()
         guard globalMonitor == nil else { return }
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown, .keyUp]) { [weak self] event in
             MainActor.assumeIsolated { self?.handle(event) }
         }
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .keyUp]) { [weak self] event in
-            MainActor.assumeIsolated { self?.handle(event) }
-            return event
+            let capturing = MainActor.assumeIsolated {
+                let capturing = self?.capturingShortcut ?? false
+                self?.handle(event)
+                return capturing
+            }
+            return capturing ? nil : event
         }
     }
+    private func installMediaObserver() {
+        guard mediaTap == nil else { return }
+        // Observe macOS media-key events without consuming or remapping them.
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly, eventsOfInterest: CGEventMask(1) << 14, callback: { _, type, event, context in
+            if type.rawValue == 14, let native = NSEvent(cgEvent: event), native.subtype.rawValue == 8,
+               ((native.data1 >> 8) & 0xff) == 0x0a, let context {
+                let model = Unmanaged<Dictation>.fromOpaque(context).takeUnretainedValue()
+                Task { @MainActor in model.cancelFnChord() }
+            }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: context) else { return }
+        mediaTap = tap
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        mediaSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+    private func cancelFnChord() {
+        guard keyDown, shortcut.keyCode == 63, !buttonRecording, !fnChord else { return }
+        fnChord = true
+        hintTask?.cancel(); holdHint = nil
+        if phase == .recording || pendingStart != nil { abort("Combinazione Fn: dettatura annullata.") }
+        transcript = ""; hideHUD?()
+    }
+    private func modifierFlag(for code: UInt16) -> NSEvent.ModifierFlags {
+        switch code { case 63: .function; case 61, 58: .option; case 62, 59: .control; case 60, 56: .shift; case 54, 55: .command; default: [] }
+    }
     private func handle(_ event: NSEvent) {
-        guard !buttonRecording else { return }
-        if event.type == .flagsChanged && event.keyCode == 63 {
-            let pressed = event.modifierFlags.contains(.function)
-            if pressed && !keyDown { keyboardPressed("fn") }
-            if !pressed && keyDown { keyboardReleased() }
-        } else if event.keyCode == 49 {
-            if event.type == .keyDown && event.modifierFlags.contains(.option) && !event.isARepeat && !keyDown { keyboardPressed("⌥Spazio") }
-            if event.type == .keyUp && keyDown { keyboardReleased() }
+        if capturingShortcut {
+            if event.type == .flagsChanged, [63, 61, 62, 60, 54].contains(event.keyCode), event.modifierFlags.contains(modifierFlag(for: event.keyCode)) {
+                let labels: [UInt16: String] = [63: "fn", 61: "⌥ destro", 62: "⌃ destro", 60: "⇧ destro", 54: "⌘ destro"]
+                shortcut = ShortcutBinding(keyCode: event.keyCode, modifiers: 0, label: labels[event.keyCode] ?? "fn", isModifier: true)
+                capturingShortcut = false
+            } else if event.type == .keyDown, !event.isARepeat {
+                if event.keyCode == 53 { capturingShortcut = false; return }
+                let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+                guard !flags.isEmpty || event.keyCode >= 96 else { return }
+                let names: [UInt16: String] = [49: "Spazio", 36: "Invio", 48: "Tab", 122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6", 98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12"]
+                let prefix = (flags.contains(.control) ? "⌃" : "") + (flags.contains(.option) ? "⌥" : "") + (flags.contains(.shift) ? "⇧" : "") + (flags.contains(.command) ? "⌘" : "")
+                shortcut = ShortcutBinding(keyCode: event.keyCode, modifiers: flags.rawValue, label: prefix + (names[event.keyCode] ?? event.charactersIgnoringModifiers?.uppercased() ?? "Tasto"), isModifier: false)
+                capturingShortcut = false
+            }
+            return
         }
+        guard shortcutEnabled, !buttonRecording else { return }
+        if shortcut.isModifier {
+            if event.type == .flagsChanged && event.keyCode == shortcut.keyCode {
+                let pressed = event.modifierFlags.contains(modifierFlag(for: shortcut.keyCode))
+                if pressed && !keyDown {
+                    let others = event.modifierFlags.intersection([.command, .option, .control, .shift]).subtracting(modifierFlag(for: shortcut.keyCode))
+                    if !others.isEmpty { keyDown = true; heldShortcut = shortcut.label; fnChord = true }
+                    else { fnChord = false; keyboardPressed(shortcut.label) }
+                }
+                if !pressed && keyDown {
+                    if fnChord { keyDown = false; fnChord = false }
+                    else { keyboardReleased() }
+                }
+            } else if keyDown && (event.type == .keyDown || event.type == .flagsChanged) { cancelModifierChord() }
+        } else if event.keyCode == shortcut.keyCode {
+            let flags = event.modifierFlags.intersection([.command, .option, .control, .shift]).rawValue
+            if event.type == .keyDown, flags == shortcut.modifiers, !event.isARepeat, !keyDown { keyboardPressed(shortcut.label) }
+            if event.type == .keyUp, keyDown { keyboardReleased() }
+        }
+    }
+    private func cancelModifierChord() {
+        guard keyDown, shortcut.isModifier, !buttonRecording, !fnChord else { return }
+        fnChord = true; hintTask?.cancel(); holdHint = nil
+        if phase == .recording || pendingStart != nil { abort("Combinazione di tasti: dettatura annullata.") }
+        transcript = ""; hideHUD?()
     }
     private func keyboardPressed(_ shortcut: String) {
         keyDown = true; pressedAt = .now; heldShortcut = shortcut
@@ -120,8 +220,10 @@ final class Dictation: ObservableObject {
         }
     }
     func refreshPermissions() {
+        refreshLoginStatus()
         microphoneAllowed = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         accessibilityAllowed = AXIsProcessTrusted()
+        if accessibilityAllowed { installMediaObserver() }
     }
     func authorizeMicrophone() {
         refreshPermissions()
@@ -259,7 +361,7 @@ final class Dictation: ObservableObject {
                 self.startSilenceWatchdog(token: token)
                 self.startSound?.stop()
                 self.startSound?.volume = 0.7
-                self.startSound?.play()
+                if self.soundEnabled { self.startSound?.play() }
                 self.pendingStart = nil; self.isStarting = false
             } catch {
                 guard self.session == token, !Task.isCancelled else { return }
@@ -292,9 +394,9 @@ final class Dictation: ObservableObject {
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
                 guard let self, self.session == token, self.phase == .recording else { return }
-                if self.lastSound.duration(to: .now) > .seconds(10) {
+                if self.silenceSeconds > 0 && self.lastSound.duration(to: .now) > .seconds(self.silenceSeconds) {
                     self.stop()
-                    self.message = "Registrazione terminata dopo 10 secondi di silenzio."
+                    self.message = "Registrazione terminata per silenzio."
                     return
                 }
             }
@@ -480,6 +582,7 @@ struct SpeedArc: Shape {
 }
 
 struct Dashboard: View {
+    @State private var showingSettings = false
     @ObservedObject var model: Dictation
     private let teal = Color(red: 0.12, green: 0.12, blue: 0.12)
     private let canvas = Color(white: 0.97)
@@ -506,7 +609,7 @@ struct Dashboard: View {
                 Image(systemName: "chart.bar.xaxis").font(.system(size: 20)).frame(width: 42, height: 42)
                     .background(Color.black.opacity(0.045), in: RoundedRectangle(cornerRadius: 10)).help("Il tuo utilizzo")
                 Spacer()
-                Image(systemName: "mic").foregroundStyle(teal).padding(.bottom, 22)
+                Button { showingSettings = true } label: { Image(systemName: "gearshape").font(.system(size: 19)).frame(width: 42, height: 42) }.buttonStyle(.plain).help("Impostazioni").padding(.bottom, 22)
             }.frame(width: 68)
             ScrollView {
                 VStack(alignment: .leading, spacing: 30) {
@@ -572,7 +675,7 @@ struct Dashboard: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 5) {
                                 Text("Pronto a dettare").font(.system(size: 24, weight: .medium, design: .serif))
-                                Text("Tieni premuto fn, oppure avvia dal notch. Stop automatico dopo 10 secondi di silenzio.").font(.system(size: 12)).foregroundStyle(.secondary)
+                                Text(model.shortcutEnabled ? "Tieni premuto \(model.shortcut.label), oppure avvia dal notch." : "Avvia la registrazione dal notch.").font(.system(size: 12)).foregroundStyle(.secondary)
                             }
                             Spacer()
                             Picker("Lingua", selection: $model.language) { Text("Italiano").tag("it-IT"); Text("English").tag("en-US") }.frame(width: 175).disabled(model.phase != .idle)
@@ -581,12 +684,9 @@ struct Dashboard: View {
                             permissionCard("Microfono", detail: "Per ascoltare e trascrivere la tua voce.", icon: "mic", granted: model.microphoneAllowed, action: model.authorizeMicrophone)
                             permissionCard("Accessibilità", detail: "Per inserire il testo nel campo attivo.", icon: "text.cursor", granted: model.accessibilityAllowed, action: model.authorizeAccessibility)
                         }
-                        HStack(spacing: 8) {
-                            Image(systemName: model.modelReady ? "checkmark.circle" : "arrow.triangle.2.circlepath")
-                            Text(model.modelStatus).font(.caption)
-                            if !model.modelReady { Button("Riprova", action: model.prepareModel).controlSize(.small) }
-                        }.foregroundStyle(.secondary)
-                        Text(model.message).font(.system(size: 13)).foregroundStyle(.secondary).textSelection(.enabled)
+                        if !model.modelReady {
+                            HStack { Text(model.modelStatus).font(.caption); Button("Riprova", action: model.prepareModel).controlSize(.small) }.foregroundStyle(.secondary)
+                        }
                     }
                     VStack(alignment: .leading, spacing: 18) {
                         HStack {
@@ -594,17 +694,8 @@ struct Dashboard: View {
                             Spacer()
                             Text("\(model.history.count) sessioni").font(.caption).foregroundStyle(.secondary)
                         }
-                        if model.history.isEmpty {
-                            Text("La tua prima trascrizione apparirà qui.").font(.system(size: 14)).foregroundStyle(.secondary).padding(.vertical, 20)
-                        } else {
-                            LazyVStack(spacing: 12) {
-                                ForEach(model.history) { usage in
-                                    TranscriptRow(usage: usage)
-                                }
-                            }
-                        }
+                        TranscriptDataTable(history: model.history)
                     }
-                    Text("Audio non salvato. Trascrizioni e statistiche sono conservate solo sul tuo Mac.").font(.caption).foregroundStyle(.secondary)
                 }.padding(36).frame(maxWidth: 1120).frame(maxWidth: .infinity)
             }
             .background(Color.white, in: RoundedRectangle(cornerRadius: 22))
@@ -613,6 +704,13 @@ struct Dashboard: View {
         }.background(canvas).foregroundStyle(Color(white: 0.10))
             .frame(minWidth: 960, minHeight: 650)
             .preferredColorScheme(.light)
+            .overlay {
+                if showingSettings {
+                    Color.black.opacity(0.25).ignoresSafeArea().onTapGesture { showingSettings = false; model.capturingShortcut = false }
+                    SettingsDialog(model: model, close: { showingSettings = false; model.capturingShortcut = false })
+                        .shadow(color: .black.opacity(0.15), radius: 28, y: 12)
+                }
+            }
             .onChange(of: model.language) { _, value in UserDefaults.standard.set(value, forKey: "language"); model.prepareModel() }
     }
     private func permissionCard(_ title: String, detail: String, icon: String, granted: Bool, action: @escaping () -> Void) -> some View {
@@ -628,8 +726,6 @@ struct Dashboard: View {
             Text(detail).font(.system(size: 12)).foregroundStyle(.secondary)
             if !granted {
                 Button("Autorizza \(title.lowercased())", action: action).buttonStyle(DashboardButtonStyle())
-            } else {
-                Text("Tutto pronto").font(.system(size: 12)).foregroundStyle(.secondary)
             }
         }.padding(18).frame(maxWidth: .infinity, minHeight: 144, alignment: .topLeading)
         .background(.white, in: RoundedRectangle(cornerRadius: 12))
@@ -675,29 +771,87 @@ struct DashboardButtonStyle: ButtonStyle {
     }
 }
 
-struct TranscriptRow: View {
+struct TranscriptDataTable: View {
+    let history: [Usage]
+    @State private var page = 0
+    private let pageSize = 10
+    private var pageCount: Int { max(1, (history.count + pageSize - 1) / pageSize) }
+    private var currentPage: Int { min(page, pageCount - 1) }
+    private var start: Int { currentPage * pageSize }
+    private var rows: [Usage] { Array(history.dropFirst(start).prefix(pageSize)) }
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 16) {
+                Text("Data").frame(width: 130, alignment: .leading)
+                Text("Trascrizione").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Parole").frame(width: 54, alignment: .trailing)
+                Text("Azioni").frame(width: 90, alignment: .trailing)
+            }.font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 16).padding(.vertical, 12).background(Color(white: 0.97))
+            Divider()
+            if rows.isEmpty {
+                Text("La tua prima trascrizione apparirà qui.").font(.system(size: 13)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity).padding(.vertical, 30)
+            } else {
+                ForEach(rows) { usage in
+                    TranscriptTableRow(usage: usage)
+                    Divider()
+                }
+            }
+            HStack(spacing: 14) {
+                Text(history.isEmpty ? "0 trascrizioni" : "\(start + 1)–\(min(start + pageSize, history.count)) di \(history.count)")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                Spacer()
+                Text("Pagina \(currentPage + 1) di \(pageCount)").font(.system(size: 12)).foregroundStyle(.secondary)
+                Button { page = max(0, currentPage - 1) } label: { Label("Precedente", systemImage: "chevron.left") }
+                    .disabled(currentPage == 0)
+                Button { page = min(pageCount - 1, currentPage + 1) } label: { HStack { Text("Successiva"); Image(systemName: "chevron.right") } }
+                    .disabled(currentPage >= pageCount - 1)
+            }.buttonStyle(.bordered).controlSize(.small).padding(14)
+        }
+        .background(.white, in: RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.black.opacity(0.09)))
+        .onChange(of: history.count) { _, _ in page = 0 }
+    }
+}
+
+struct TranscriptTableRow: View {
     let usage: Usage
     @State private var copied = false
+    @State private var showText = false
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(usage.date, format: .dateTime.day().month().year().hour().minute()).font(.system(size: 11)).foregroundStyle(.secondary)
-                Text("· \(usage.words) parole").font(.system(size: 11)).foregroundStyle(.secondary)
-                Spacer()
+        HStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(usage.date, format: .dateTime.day().month().year())
+                Text(usage.date, format: .dateTime.hour().minute()).foregroundStyle(.secondary)
+            }.font(.system(size: 11)).frame(width: 130, alignment: .leading)
+            if let text = usage.text {
+                Button { showText = true } label: {
+                    Text(text).font(.system(size: 13)).lineLimit(2).multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                }.buttonStyle(.plain).help("Mostra la trascrizione completa")
+                .popover(isPresented: $showText) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("Trascrizione").font(.system(size: 20, design: .serif))
+                        ScrollView { Text(text).font(.system(size: 14)).lineSpacing(4).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                    }.padding(20).frame(width: 420, height: 240)
+                }
+            } else {
+                Text("Testo non salvato nella versione precedente").font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("\(usage.words)").font(.system(size: 12)).monospacedDigit().frame(width: 54, alignment: .trailing)
+            Group {
                 if let text = usage.text {
                     Button {
                         NSPasteboard.general.clearContents()
                         copied = NSPasteboard.general.setString(text, forType: .string)
                     } label: { Label(copied ? "Copiato" : "Copia", systemImage: copied ? "checkmark" : "doc.on.doc") }
-                    .buttonStyle(DashboardButtonStyle())
-                }
-            }
-            Text(usage.text ?? "Testo non disponibile: questa sessione è precedente alla cronologia delle trascrizioni.")
-                .font(.system(size: 14)).lineSpacing(4).textSelection(.enabled)
-                .foregroundStyle(usage.text == nil ? .secondary : .primary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }.padding(18).background(LinearGradient(colors: [.white, Color(white: 0.99)], startPoint: .top, endPoint: .bottom), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(.black.opacity(0.08)))
+                        .buttonStyle(.bordered).controlSize(.small)
+                } else { Text("—").foregroundStyle(.tertiary) }
+            }.frame(width: 90, alignment: .trailing)
+        }.padding(.horizontal, 16).frame(height: 64)
     }
 }
 
@@ -875,5 +1029,96 @@ struct MyWisprApp: App {
             Divider()
             Button("Esci") { NSApp.terminate(nil) }
         }
+    }
+}
+
+struct SettingsDialog: View {
+    @ObservedObject var model: Dictation
+    let close: () -> Void
+    @State private var systemTab = false
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("IMPOSTAZIONI").font(.system(size: 11, weight: .semibold)).tracking(1).foregroundStyle(.secondary).padding(.bottom, 16)
+                tab("Generali", icon: "slider.horizontal.3", selected: !systemTab) { systemTab = false }
+                tab("Sistema", icon: "laptopcomputer", selected: systemTab) { systemTab = true }
+                Spacer()
+                Text("My Wispr").font(.system(size: 12)).foregroundStyle(.secondary)
+            }.padding(22).frame(width: 185).background(Color(white: 0.965))
+            VStack(alignment: .leading, spacing: 24) {
+                HStack {
+                    Text(systemTab ? "Sistema" : "Generali").font(.system(size: 30, design: .serif))
+                    Spacer()
+                    Button(action: close) { Image(systemName: "xmark").frame(width: 28, height: 28) }.buttonStyle(.plain).help("Chiudi impostazioni")
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        if !systemTab {
+                            settingRow("Scorciatoia di registrazione", subtitle: "Tieni premuto il tasto per parlare; rilascia per trascrivere.") {
+                                Toggle("Attiva", isOn: $model.shortcutEnabled).toggleStyle(.switch).controlSize(.small)
+                            }
+                            Divider()
+                            settingRow(model.capturingShortcut ? "Premi la nuova scorciatoia…" : "Tasto assegnato: \(model.shortcut.label)", subtitle: model.capturingShortcut ? "Fn, un modificatore destro o una combinazione. Esc per annullare." : "Fn + altri tasti resta disponibile per le funzioni del Mac.") {
+                                Button(model.capturingShortcut ? "Annulla" : "Modifica") { model.capturingShortcut.toggle() }.buttonStyle(DashboardButtonStyle())
+                            }
+                            Divider()
+                            settingRow("Lingua di dettatura", subtitle: "Il modello vocale viene preparato per la lingua scelta.") {
+                                Picker("Lingua", selection: $model.language) { Text("Italiano").tag("it-IT"); Text("English").tag("en-US") }.labelsHidden().frame(width: 135)
+                            }
+                            Divider()
+                            settingRow("Suono di avvio", subtitle: "Riproduci il suono quando il microfono inizia a registrare.") {
+                                Toggle("Suono", isOn: $model.soundEnabled).labelsHidden().toggleStyle(.switch).controlSize(.small)
+                            }
+                            Divider()
+                            settingRow("Stop automatico", subtitle: "Termina la registrazione dopo un periodo di silenzio.") {
+                                Picker("Silenzio", selection: $model.silenceSeconds) { Text("Disattivato").tag(0.0); Text("5 secondi").tag(5.0); Text("10 secondi").tag(10.0); Text("20 secondi").tag(20.0); Text("30 secondi").tag(30.0) }.labelsHidden().frame(width: 135)
+                            }
+                        } else {
+                            loginSection
+                            settingRow("Microfono", subtitle: model.microphoneAllowed ? "Autorizzato" : "Necessario per registrare la tua voce.") {
+                                Button("Apri impostazioni", action: model.authorizeMicrophone).buttonStyle(DashboardButtonStyle())
+                            }
+                            Divider()
+                            settingRow("Accessibilità", subtitle: model.accessibilityAllowed ? "Autorizzata" : "Necessaria per inserire il testo nelle altre app.") {
+                                Button("Apri impostazioni", action: model.authorizeAccessibility).buttonStyle(DashboardButtonStyle())
+                            }
+                            Divider()
+                            settingRow("Microfono di sistema", subtitle: "My Wispr usa il dispositivo di ingresso selezionato da macOS.") {
+                                Button("Modifica") { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")!) }.buttonStyle(DashboardButtonStyle())
+                            }
+                        }
+                    }.padding(.horizontal, 18).background(Color(white: 0.975), in: RoundedRectangle(cornerRadius: 12))
+                        .disabled(model.phase != .idle || model.isStarting)
+                }
+                Spacer(minLength: 0)
+            }.padding(30).frame(maxWidth: .infinity)
+        }.frame(width: 850, height: 560).background(.white, in: RoundedRectangle(cornerRadius: 18))
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .overlay(RoundedRectangle(cornerRadius: 18).stroke(.black.opacity(0.08)))
+            .onExitCommand(perform: close)
+    }
+    @ViewBuilder private var loginSection: some View {
+                            settingRow("Avvia al login", subtitle: "Apri My Wispr automaticamente quando accedi al Mac.") {
+                                Toggle("Avvia al login", isOn: Binding(get: { model.launchAtLogin }, set: { enabled in model.setLaunchAtLogin(enabled) })).labelsHidden().toggleStyle(.switch).controlSize(.small)
+                            }
+                            if model.loginNeedsApproval {
+                                HStack {
+                                    Text("Completa l’autorizzazione negli elementi di login di macOS.").font(.system(size: 11)).foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button("Apri") { SMAppService.openSystemSettingsLoginItems() }.buttonStyle(DashboardButtonStyle())
+                                }.padding(.bottom, 16)
+                            }
+                            if let error = model.loginError { Text(error).font(.system(size: 11)).foregroundStyle(.secondary).padding(.bottom, 16) }
+                            Divider()
+    }
+    private func tab(_ title: String, icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Label(title, systemImage: icon).font(.system(size: 14, weight: .medium)).frame(maxWidth: .infinity, alignment: .leading).padding(10).background(Color.black.opacity(selected ? 0.055 : 0), in: RoundedRectangle(cornerRadius: 8)) }.buttonStyle(.plain)
+    }
+    private func settingRow<Content: View>(_ title: String, subtitle: String, @ViewBuilder control: () -> Content) -> some View {
+        HStack(spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) { Text(title).font(.system(size: 13, weight: .semibold)); Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            Spacer(minLength: 5)
+            control()
+        }.padding(.vertical, 19)
     }
 }
