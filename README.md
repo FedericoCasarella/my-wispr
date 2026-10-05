@@ -1,32 +1,44 @@
 # My Wispr
 
-Prima versione nativa macOS, SwiftUI + AppKit. Richiede Mac Apple Silicon e macOS 26 o successivo. Nessuna chiave API o dipendenza esterna.
+App nativa macOS per dettare nei campi di testo, recuperare gli appunti e raccogliere note vocali.
 
-## Avvio
+## Installazione
 
-Esegui `./build.sh`, poi apri `build/MyWispr.app`.
+Scarica il DMG dalla [pagina delle release](https://github.com/FedericoCasarella/my-wispr/releases), aprilo e trascina **MyWispr.app** in **Applications**. Apri l’app dalla cartella Applicazioni.
 
-1. Premi **Abilita permessi** e autorizza Microfono e Accessibilità nelle Impostazioni di Sistema → Privacy e sicurezza. Se il tasto globale non viene rilevato, autorizza anche Monitoraggio input e riapri l’app.
-2. In Impostazioni di Sistema → Tastiera, imposta «Premi il tasto fn per» su «Non fare nulla», per evitare conflitti con la dettatura Apple o il selettore emoji.
-3. Posiziona il cursore in un campo di testo di un’altra app, tieni premuto **fn**, parla e rilascia. Alternativa: tieni premuto **⌥Spazio** (disattiva eventuali scorciatoie concorrenti).
-4. Il menu con l’icona waveform permette di riaprire le statistiche. Chiudere la finestra lascia l’app attiva; «Esci» la termina.
+Richiede **Mac Apple Silicon e macOS 26 o successivo**. La release iniziale è un’anteprima con firma ad hoc, non notarizzata da Apple. Se macOS blocca l’apertura, puoi autorizzarla in Impostazioni di Sistema → Privacy e sicurezza → Apri comunque, dopo averne verificato la provenienza. Il checksum SHA-256 è allegato alla release.
 
-## Comportamento e limiti
+Autorizza Microfono e Accessibilità. Nelle impostazioni Tastiera di macOS scegli «Nessuna azione» per il tasto Fn, per evitare l’apertura del selettore emoji.
 
-Il motore SpeechAnalyzer / SpeechTranscriber di macOS 26 riconosce la voce localmente durante la registrazione. Non richiede che Siri o la dettatura di sistema siano attivi. Il modello della lingua viene scaricato da Apple al primo avvio se manca; lo stato è mostrato nella finestra. Attendere «Modello locale pronto» prima di dettare. Al rilascio finalizza l’audio senza un timeout che possa troncare il testo; 1–2 secondi è un obiettivo da misurare, non una garanzia.
+## Funzioni
 
-La righetta arrotondata in basso si espande con microfono e onde durante l’ascolto e si richiude al rilascio. Le onde reagiscono al livello del microfono; rispettano l’impostazione Riduci movimento. I permessi vengono ricontrollati ogni secondo. Dopo una nuova compilazione la firma ad hoc può invalidare i permessi: rimuovere la vecchia voce e autorizzare la nuova app in Privacy e sicurezza se necessario.
+- Tieni premuto Fn per dettare e rilascia per inserire il testo nel campo attivo. Scorciatoia modificabile nelle impostazioni.
+- Notch traslucido, trascinabile e configurabile per monitor; pulsanti di registrazione e appunti al passaggio del mouse.
+- Cronologia appunti attivabile: doppio Shift, frecce per scegliere, Invio per copiare e incollare. Conserva fino a 40 testi/link in memoria fino alla chiusura dell’app.
+- Dashboard con statistiche reali e trascrizioni paginate, dieci righe per pagina.
+- Notetaker nella dashboard o in una finestra dedicata aperta dal menu di sistema. Registrazione continua fino a Stop, ricerca, salvataggio locale e swipe per eliminare con conferma.
+- Riscrittura delle note tramite Claude Code, mantenendo originale e risultato separati. Richiede la CLI `claude` e l’accesso con `claude auth login`; si applicano i limiti e le condizioni del proprio account. Nessuna chiave API richiesta dalla dettatura.
+- Avvio al login, lingua, suoni e arresto per silenzio configurabili. Le note registrate non si interrompono durante le pause.
 
-L’inserimento usa il campo di testo attivo tramite Accessibilità, oppure il normale comando Incolla per gli editor che non supportano la scrittura diretta. In questo caso gli appunti precedenti vengono ripristinati dopo 800 ms, salvo che l’utente abbia copiato altro nel frattempo. «Incolla inviato» indica l’invio del comando, non una conferma dell’editor. Se non c’è un campo attivo, manca Accessibilità o è cambiata l’app, il notch mostra una scheda di vetro con trascrizione, Copia e Chiudi. Non basta passare il puntatore sopra un campo: deve esserci il cursore di scrittura.
+La dettatura usa SpeechAnalyzer/SpeechTranscriber di Apple: il modello della lingua viene scaricato al primo utilizzo se necessario. Non garantiamo un tempo fisso di trascrizione; la latenza è misurata nella dashboard. L’inserimento richiede un campo testuale con cursore attivo, non soltanto il puntatore sopra il campo. Senza destinazione valida, la trascrizione resta copiabile nel notch.
 
-La dashboard Insights mostra solo dati reali: velocità media ponderata per durata, sessioni, parole totali, latenza, cronologia e attività giornaliera nelle ultime 12 settimane. Nessuna classifica, percentuale o categoria viene inventata. Le altre sezioni verranno aggiunte successivamente.
+L’audio non viene salvato. Trascrizioni e statistiche sono in `~/Library/Application Support/MyWispr/usage.json`; note e versioni riscritte in `~/Library/Application Support/MyWispr/notes.json`. Premendo Riscrivi con Claude il testo della nota viene inviato al servizio tramite la CLI.
 
-Gli audio non vengono salvati. Da questa versione, testo delle trascrizioni e statistiche vengono salvati localmente in `~/Library/Application Support/MyWispr/usage.json` e mostrati nella lista completa con Copia. Il testo delle vecchie sessioni non è recuperabile perché le versioni precedenti conservavano solo statistiche.
+## Sviluppo e release
 
-La registrazione si arresta dopo oltre 10 secondi consecutivi senza segnale significativo (soglia circa −45 dB RMS); i risultati vocali ricevuti aggiornano anche il rilevamento. Rumori forti possono mantenere attiva la registrazione. Il watchdog viene cancellato al termine della sessione.
+Serve Xcode con SDK macOS 26 e Swift 6.
 
-## Verifica
+```sh
+./build.sh
+open build/MyWispr.app
+```
 
-Compilazione con Swift 6 e firma ad hoc. La prova end-to-end richiede i permessi macOS, una voce reale e un campo di destinazione: non è sostituita dalla compilazione. Verificare: italiano/inglese, rilascio rapido, nessuna parola, permessi negati, cambio app durante registrazione, inserimento in TextEdit/browser, riapertura e persistenza statistiche.
+Per creare il DMG e il checksum:
 
-La firma ad hoc è adatta allo sviluppo locale. Una distribuzione pubblica richiede firma Developer ID e notarizzazione. Dopo una nuova compilazione macOS potrebbe richiedere di aggiornare i permessi di Accessibilità.
+```sh
+./release.sh
+```
+
+La distribuzione pubblica senza avvisi Gatekeeper richiede un certificato Developer ID e notarizzazione Apple. I certificati Apple Development non sostituiscono Developer ID per questo scopo. La compilazione verifica il codice; microfono e inserimento vanno provati su un Mac con permessi autorizzati.
+
+Le icone Lucide sono distribuite secondo la licenza riportata in `THIRD_PARTY/Lucide-LICENSE`.

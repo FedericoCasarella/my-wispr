@@ -25,13 +25,115 @@ struct ShortcutBinding: Codable {
 
 @MainActor
 final class Dictation: ObservableObject {
+    @Published var clipboardEnabled = UserDefaults.standard.bool(forKey: "clipboardEnabled") { didSet { UserDefaults.standard.set(clipboardEnabled, forKey: "clipboardEnabled"); if !clipboardEnabled { closeClipboard() } } }
+    @Published var clipboardItems: [String] = []
+    @Published var clipboardZoomAnchor = UnitPoint.bottom
+    var clipboardButtonOffset: CGFloat = 28
+    var clipboardButtonHeight: CGFloat = 9
+    @Published var showsClipboard = false
+    @Published var clipboardSelection = 0
+    @Published var clipboardBinding = UserDefaults.standard.data(forKey: "clipboardBinding").flatMap { try? JSONDecoder().decode(ShortcutBinding.self, from: $0) }
+    @Published var captureClipboardBinding = false
+    private var clipboardTimer: Timer?
+    private var clipboardCount = NSPasteboard.general.changeCount
+    private var lastShiftTap: TimeInterval = 0
+    private var shiftStarted: TimeInterval = 0
+    private var shiftChord = false
+    private var clipboardTarget: NSRunningApplication?
+    var showClipboardHUD: (() -> Void)?
+    var closeClipboardHUD: (() -> Void)?
+    func pollClipboard() {
+        guard clipboardEnabled else { clipboardCount = NSPasteboard.general.changeCount; return }
+        let board = NSPasteboard.general
+        guard board.changeCount != clipboardCount else { return }
+        clipboardCount = board.changeCount
+        // Password managers mark confidential clipboard content with these types.
+        guard !(board.types ?? []).contains(where: { $0.rawValue == "org.nspasteboard.ConcealedType" || $0.rawValue == "org.nspasteboard.TransientType" }),
+              let text = board.string(forType: .string), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        clipboardItems.removeAll { $0 == text }
+        clipboardItems.insert(text, at: 0)
+        clipboardItems = Array(clipboardItems.prefix(40))
+    }
+    func openClipboard() {
+        guard clipboardEnabled, phase == .idle, !isStarting, !showsCopyPreview else { return }
+        if showsClipboard { closeClipboard(); return }
+        pollClipboard()
+        clipboardTarget = NSWorkspace.shared.frontmostApplication
+        clipboardSelection = 0
+        showClipboardHUD?()
+        showsClipboard = true
+        if soundEnabled { clipboardSound?.stop(); clipboardSound?.volume = 0.7; clipboardSound?.play() }
+    }
+    func closeClipboard() {
+        guard showsClipboard else { return }
+        showsClipboard = false
+        closeClipboardHUD?()
+    }
+    func clipboardKey(_ code: UInt16) {
+        switch code {
+        case 125: clipboardSelection = min(max(0, clipboardItems.count - 1), clipboardSelection + 1)
+        case 126: clipboardSelection = max(0, clipboardSelection - 1)
+        case 53: closeClipboard()
+        case 36: pasteClipboard()
+        default: break
+        }
+    }
+    func pasteClipboard() {
+        guard clipboardItems.indices.contains(clipboardSelection) else { return }
+        let text = clipboardItems[clipboardSelection]
+        let destination = clipboardTarget
+        let board = NSPasteboard.general
+        board.clearContents(); board.setString(text, forType: .string)
+        clipboardCount = board.changeCount
+        closeClipboard()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !self.showsClipboard, self.phase == .idle else { return }
+            self.notchNotice = "Copiato"
+            self.hideHUD?()
+            try? await Task.sleep(for: .seconds(2.5))
+            self.notchNotice = nil
+        }
+        guard let destination, !destination.isTerminated else { return }
+        destination.activate()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == destination.processIdentifier,
+                  let source = CGEventSource(stateID: .privateState),
+                  let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else { return }
+            down.flags = .maskCommand; up.flags = .maskCommand
+            down.postToPid(destination.processIdentifier); up.postToPid(destination.processIdentifier)
+        }
+    }
     enum Phase { case idle, recording, finishing }
     @Published var phase: Phase = .idle
     @Published var message = "Pronto quando lo sei tu."
-    @Published var transcript = ""
+    let notes = NotesStore()
+    @Published var noteRecordingID: UUID?
+    private var noteBase = ""
+    private var noteTranscriptBase = ""
+    var openNotes: (() -> Void)?
+    func startNote(_ id: UUID) {
+        guard phase == .idle, !isStarting, modelReady, microphoneAllowed, let note = notes.notes.first(where: { $0.id == id }) else { return }
+        noteRecordingID = id; noteBase = note.body; noteTranscriptBase = note.transcript
+        start(fromButton: true)
+        if !isStarting && phase == .idle { noteRecordingID = nil }
+    }
+    @Published var transcript = "" {
+        didSet {
+            if let id = noteRecordingID {
+                notes.update(id) { note in
+                    note.body = noteBase + (noteBase.isEmpty || transcript.isEmpty ? "" : "\n\n") + transcript
+                    note.transcript = noteTranscriptBase + (noteTranscriptBase.isEmpty || transcript.isEmpty ? "" : "\n\n") + transcript
+                }
+            }
+        }
+    }
     @Published var audioLevel: Double = 0
     @Published var showsCopyPreview = false
     @Published var previewCopied = false
+    @Published var notchNotice: String?
     @Published var holdHint: String?
     private var hintTask: Task<Void, Never>?
     private var pressedAt = ContinuousClock.now
@@ -62,6 +164,7 @@ final class Dictation: ObservableObject {
     }
     @Published var language = UserDefaults.standard.string(forKey: "language") ?? "it-IT"
     private let engine = AVAudioEngine()
+    private let clipboardSound: NSSound? = Bundle.main.url(forResource: "clipboard-open", withExtension: "wav").flatMap { NSSound(contentsOf: $0, byReference: false) }
     private let startSound: NSSound? = Bundle.main.url(forResource: "recording-start", withExtension: "wav").flatMap { NSSound(contentsOf: $0, byReference: false) }
     @Published var microphoneAllowed = false
     @Published var accessibilityAllowed = false
@@ -95,6 +198,14 @@ final class Dictation: ObservableObject {
     private var mediaSource: CFRunLoopSource?
     @Published private(set) var buttonRecording = false
     @Published var isStarting = false
+    @Published var notchScreenID = UserDefaults.standard.string(forKey: "notchScreenID") ?? "" {
+        didSet { UserDefaults.standard.set(notchScreenID, forKey: "notchScreenID"); resetHUDPosition?() }
+    }
+    var notchScreen: NSScreen? {
+        NSScreen.screens.first { Self.screenID($0) == notchScreenID } ?? NSScreen.main ?? NSScreen.screens.first
+    }
+    static func screenID(_ screen: NSScreen) -> String { (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.stringValue ?? "" }
+    var resetHUDPosition: (() -> Void)?
     var showHUD: (() -> Void)?
     var hideHUD: (() -> Void)?
     var showCopyHUD: (() -> Void)?
@@ -107,8 +218,9 @@ final class Dictation: ObservableObject {
     func installShortcut() {
         refreshPermissions()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { @Sendable [weak self] _ in
-            Task { @MainActor in self?.refreshPermissions() }
+            Task { @MainActor in self?.refreshPermissions(); self?.pollClipboard() }
         }
+        clipboardTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { @Sendable [weak self] _ in Task { @MainActor in self?.pollClipboard() } }
         prepareModel()
         installMediaObserver()
         guard globalMonitor == nil else { return }
@@ -117,7 +229,7 @@ final class Dictation: ObservableObject {
         }
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .keyUp]) { [weak self] event in
             let capturing = MainActor.assumeIsolated {
-                let capturing = self?.capturingShortcut ?? false
+                let capturing = (self?.capturingShortcut ?? false) || (self?.showsClipboard ?? false)
                 self?.handle(event)
                 return capturing
             }
@@ -153,7 +265,27 @@ final class Dictation: ObservableObject {
         switch code { case 63: .function; case 61, 58: .option; case 62, 59: .control; case 60, 56: .shift; case 54, 55: .command; default: [] }
     }
     private func handle(_ event: NSEvent) {
+        if showsClipboard { if event.type == .keyDown { clipboardKey(event.keyCode) }; return }
+        if clipboardEnabled, !capturingShortcut {
+            if let binding = clipboardBinding {
+                if binding.isModifier, event.type == .flagsChanged, event.keyCode == binding.keyCode, event.modifierFlags.contains(modifierFlag(for: binding.keyCode)) { openClipboard(); return }
+                if !binding.isModifier, event.type == .keyDown, !event.isARepeat, event.keyCode == binding.keyCode,
+                   event.modifierFlags.intersection([.command, .option, .control, .shift]).rawValue == binding.modifiers { openClipboard(); return }
+            } else {
+                if event.type == .keyDown { shiftChord = true; lastShiftTap = 0 }
+                if event.type == .flagsChanged, [56, 60].contains(event.keyCode) {
+                    if event.modifierFlags.contains(.shift) { shiftStarted = event.timestamp; shiftChord = !event.modifierFlags.intersection([.command, .control, .option]).isEmpty }
+                    else if !shiftChord, event.timestamp - shiftStarted < 0.3 {
+                        if lastShiftTap > 0, event.timestamp - lastShiftTap < 0.45 { lastShiftTap = 0; openClipboard(); return }
+                        lastShiftTap = event.timestamp
+                    }
+                }
+            }
+        }
+
         if capturingShortcut {
+            let original = shortcut
+            defer { if captureClipboardBinding, !capturingShortcut { clipboardBinding = shortcut; shortcut = original; captureClipboardBinding = false; if let data = try? JSONEncoder().encode(clipboardBinding) { UserDefaults.standard.set(data, forKey: "clipboardBinding") } } }
             if event.type == .flagsChanged, [63, 61, 62, 60, 54].contains(event.keyCode), event.modifierFlags.contains(modifierFlag(for: event.keyCode)) {
                 let labels: [UInt16: String] = [63: "fn", 61: "⌥ destro", 62: "⌃ destro", 60: "⇧ destro", 54: "⌘ destro"]
                 shortcut = ShortcutBinding(keyCode: event.keyCode, modifiers: 0, label: labels[event.keyCode] ?? "fn", isModifier: true)
@@ -372,6 +504,7 @@ final class Dictation: ObservableObject {
     }
     func stop() {
         buttonRecording = false
+        if pendingStart != nil, noteRecordingID != nil { abort("Registrazione annullata."); return }
         if let pendingStart { pendingStart.cancel(); return }
         guard phase == .recording, let analyzer else { return }
         stopped = Date(); phase = .finishing; message = "Sto completando…"
@@ -394,7 +527,7 @@ final class Dictation: ObservableObject {
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
                 guard let self, self.session == token, self.phase == .recording else { return }
-                if self.silenceSeconds > 0 && self.lastSound.duration(to: .now) > .seconds(self.silenceSeconds) {
+                if self.noteRecordingID == nil && self.silenceSeconds > 0 && self.lastSound.duration(to: .now) > .seconds(self.silenceSeconds) {
                     self.stop()
                     self.message = "Registrazione terminata per silenzio."
                     return
@@ -415,7 +548,8 @@ final class Dictation: ObservableObject {
         deadline?.cancel(); deadline = nil
         resultsTask?.cancel(); resultsTask = nil; analyzer = nil; transcriber = nil
         phase = .idle; hideHUD?(); prepareModel()
-        guard !text.isEmpty else { message = "Nessuna parola riconosciuta. Riprova."; return }
+        guard !text.isEmpty else { noteRecordingID = nil; notes.save(); message = "Nessuna parola riconosciuta. Riprova."; return }
+        if noteRecordingID != nil { noteRecordingID = nil; notes.save(); message = "Nota salvata."; return }
         let inserted = insert(text)
         if !inserted { showsCopyPreview = true; showCopyHUD?() }
         history.insert(Usage(date: Date(), words: text.split(whereSeparator: { $0.isWhitespace }).count, duration: stopped.timeIntervalSince(started), latency: latency, inserted: inserted, text: text), at: 0)
@@ -426,6 +560,7 @@ final class Dictation: ObservableObject {
         } catch { message = "Testo pronto. Statistiche non salvate: \(error.localizedDescription)" }
     }
     private func abort(_ reason: String) {
+        noteRecordingID = nil; notes.save()
         buttonRecording = false; isStarting = false
         session = UUID(); pendingStart?.cancel(); pendingStart = nil; deadline?.cancel(); stopAudio()
         continuation?.finish(); continuation = nil; resultsTask?.cancel(); resultsTask = nil
@@ -583,6 +718,8 @@ struct SpeedArc: Shape {
 
 struct Dashboard: View {
     @State private var showingSettings = false
+    @State private var clipboardPage = false
+    @State private var notesPage = false
     @ObservedObject var model: Dictation
     private let teal = Color(red: 0.12, green: 0.12, blue: 0.12)
     private let canvas = Color(white: 0.97)
@@ -606,12 +743,17 @@ struct Dashboard: View {
         HStack(spacing: 0) {
             VStack(spacing: 28) {
                 Image(systemName: "waveform").font(.system(size: 25, weight: .bold)).padding(.top, 22)
-                Image(systemName: "chart.bar.xaxis").font(.system(size: 20)).frame(width: 42, height: 42)
-                    .background(Color.black.opacity(0.045), in: RoundedRectangle(cornerRadius: 10)).help("Il tuo utilizzo")
+                Button { clipboardPage = false; notesPage = false } label: { LucideIcon(name: "chart").frame(width: 42, height: 42)
+                    .background(Color.black.opacity(clipboardPage || notesPage ? 0 : 0.09), in: RoundedRectangle(cornerRadius: 10)).help("Il tuo utilizzo") }.buttonStyle(.plain)
+                Button { clipboardPage = true; notesPage = false } label: { LucideIcon(name: "clipboard").frame(width: 42, height: 42).background(Color.black.opacity(clipboardPage ? 0.09 : 0), in: RoundedRectangle(cornerRadius: 10)) }.buttonStyle(.plain).help("Appunti")
+                Button { notesPage = true; clipboardPage = false } label: { LucideIcon(name: "notes").frame(width: 42, height: 42).background(Color.black.opacity(notesPage ? 0.09 : 0), in: RoundedRectangle(cornerRadius: 10)) }.buttonStyle(.plain).help("Note")
                 Spacer()
-                Button { showingSettings = true } label: { Image(systemName: "gearshape").font(.system(size: 19)).frame(width: 42, height: 42) }.buttonStyle(.plain).help("Impostazioni").padding(.bottom, 22)
-            }.frame(width: 68)
+                Button { showingSettings = true } label: { LucideIcon(name: "settings").frame(width: 42, height: 42) }.buttonStyle(.plain).help("Impostazioni").padding(.bottom, 22)
+            }.frame(width: 68).frame(maxHeight: .infinity)
+            Group {
+                if notesPage { NotesView(model: model, store: model.notes, embedded: true) } else {
             ScrollView {
+                if clipboardPage { ClipboardPage(model: model) } else {
                 VStack(alignment: .leading, spacing: 30) {
                     HStack {
                         Text("Insights").font(.system(size: 28, weight: .medium, design: .serif))
@@ -697,8 +839,13 @@ struct Dashboard: View {
                         TranscriptDataTable(history: model.history)
                     }
                 }.padding(36).frame(maxWidth: 1120).frame(maxWidth: .infinity)
+                }
             }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.white, in: RoundedRectangle(cornerRadius: 22))
+            .clipShape(RoundedRectangle(cornerRadius: 22))
             .overlay(RoundedRectangle(cornerRadius: 22).stroke(.black.opacity(0.05), lineWidth: 1))
             .padding(.trailing, 12).padding(.vertical, 12)
         }.background(canvas).foregroundStyle(Color(white: 0.10))
@@ -885,10 +1032,13 @@ struct RecordingHUD: View {
     private let weights: [Double] = [0.35, 0.65, 0.9, 1, 0.8, 0.55, 0.3]
     @State private var hovered = false
     private var listening: Bool { model.phase == .recording }
-    private var expanded: Bool { hovered || listening || model.isStarting || model.holdHint != nil }
+    private var expanded: Bool { hovered || listening || model.isStarting || model.holdHint != nil || model.notchNotice != nil }
     private var notchWidth: CGFloat { model.holdHint != nil ? 350 : listening ? (model.buttonRecording ? 106 : 82) : 112 }
     var body: some View {
         ZStack(alignment: .bottom) {
+            if model.showsClipboard {
+                ClipboardPopup(model: model).transition(reduceMotion ? .opacity : .scale(scale: 0.06, anchor: model.clipboardZoomAnchor).combined(with: .opacity))
+            }
             if model.showsCopyPreview {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack {
@@ -917,11 +1067,14 @@ struct RecordingHUD: View {
 
                 .transition(reduceMotion ? .opacity : .scale(scale: 0.92, anchor: .bottom).combined(with: .opacity))
             }
+            HStack(alignment: .bottom, spacing: 8) {
             ZStack(alignment: .bottom) {
-            Capsule(style: .continuous).fill(.black.opacity(0.96))
+            Capsule(style: .continuous).fill(.black.opacity(expanded ? 0.96 : 0.45))
                 .frame(width: expanded ? notchWidth : 48, height: model.holdHint != nil ? 48 : expanded ? 32 : 6)
             HStack(spacing: 5) {
-                if let shortcut = model.holdHint {
+                if let notice = model.notchNotice {
+                    Label(notice, systemImage: "checkmark").font(.system(size: 12, weight: .medium))
+                } else if let shortcut = model.holdHint {
                     HStack(spacing: 5) {
                         Text("Tieni premuto il tasto")
                         Text(shortcut).fontWeight(.semibold)
@@ -961,14 +1114,36 @@ struct RecordingHUD: View {
             .allowsHitTesting(expanded)
             .frame(width: notchWidth, height: model.holdHint != nil ? 48 : 32)
         }
-        .frame(width: notchWidth, height: model.holdHint != nil ? 48 : 32)
+        .frame(width: expanded ? notchWidth : 48, height: model.holdHint != nil ? 48 : 32)
+        if model.clipboardEnabled && hovered && model.holdHint == nil && model.notchNotice == nil {
+            Button(action: model.openClipboard) {
+                LucideIcon(name: "clipboard", size: 14).foregroundStyle(.white)
+                    .opacity(expanded ? 1 : 0)
+                    .frame(width: expanded ? 32 : 6, height: expanded ? 32 : 6)
+                    .contentShape(Capsule(style: .continuous))
+            }.buttonStyle(NotchButtonStyle())
+                .background(.black.opacity(0.96), in: Capsule(style: .continuous))
+                .transition(.scale(scale: 0.8).combined(with: .opacity))
+                .accessibilityLabel("Apri appunti").help("Apri appunti")
+        }
+        }
         .contentShape(Rectangle())
-        .onHover { hovered = $0 }
-        .opacity(model.showsCopyPreview ? 0 : 1)
+        .onHover {
+            hovered = $0
+            model.clipboardButtonOffset = (expanded ? notchWidth : 48) / 2 + 4
+            model.clipboardButtonHeight = expanded ? 22 : 9
+        }
+        .contextMenu {
+            Button("Apri Note") { model.openNotes?() }
+            Button("Ripristina posizione", systemImage: "arrow.counterclockwise") { model.resetHUDPosition?() }
+        }
+        .opacity(model.showsCopyPreview || model.showsClipboard ? 0 : 1)
             }
         .animation(reduceMotion ? .linear(duration: 0.15) : .timingCurve(0.23, 1, 0.32, 1, duration: 0.2), value: expanded)
         .animation(reduceMotion ? .linear(duration: 0.15) : .spring(response: 0.35, dampingFraction: 1), value: model.showsCopyPreview)
+        .animation(reduceMotion ? .linear(duration: 0.15) : .spring(response: 0.35, dampingFraction: 1), value: model.showsClipboard)
         .animation(reduceMotion ? .linear(duration: 0.15) : .spring(response: 0.35, dampingFraction: 1), value: model.holdHint)
+        .animation(reduceMotion ? .linear(duration: 0.15) : .spring(response: 0.35, dampingFraction: 1), value: model.notchNotice)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .padding(.bottom, 6)
         .accessibilityLabel(listening ? "Microfono attivo, ascolto in corso" : "Dettatura pronta")
@@ -976,30 +1151,120 @@ struct RecordingHUD: View {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class MovableNotchPanel: NSPanel {
+    var canDrag: (() -> Bool)?
+    var acceptsKeyboard: (() -> Bool)?
+    var keyboardAction: ((UInt16) -> Void)?
+    override func keyDown(with event: NSEvent) {
+        if acceptsKeyboard?() == true { keyboardAction?(event.keyCode) }
+        // The nonactivating notch has no text responder: never forward to the system beep.
+    }
+    override func keyUp(with event: NSEvent) {}
+    override var canBecomeKey: Bool { acceptsKeyboard?() == true }
+    private var pressEvent: NSEvent?
+    private var pressPoint = NSPoint.zero
+    private var initialOrigin = NSPoint.zero
+    private var dragging = false
+
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown where canDrag?() == true:
+            pressEvent = event
+            pressPoint = NSEvent.mouseLocation
+            initialOrigin = frame.origin
+            dragging = false
+            return
+        case .leftMouseDragged where pressEvent != nil:
+            let point = NSEvent.mouseLocation
+            let dx = point.x - pressPoint.x, dy = point.y - pressPoint.y
+            if hypot(dx, dy) > 5 { dragging = true }
+            if dragging { setFrameOrigin(NSPoint(x: initialOrigin.x + dx, y: initialOrigin.y + dy)) }
+            return
+        case .leftMouseUp where pressEvent != nil:
+            let down = pressEvent
+            pressEvent = nil
+            if dragging {
+                UserDefaults.standard.set(frame.midX, forKey: "notchCenterX")
+                UserDefaults.standard.set(frame.minY, forKey: "notchBottomY")
+                dragging = false
+                return
+            }
+            if let down { super.sendEvent(down) }
+            super.sendEvent(event)
+            return
+        default: super.sendEvent(event)
+        }
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = Dictation()
+    private var notesWindow: NSWindow?
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "Notetaker", action: #selector(openNotesFromDock), keyEquivalent: "")
+        item.target = self; menu.addItem(item); return menu
+    }
+    @objc private func openNotesFromDock() { showNotesWindow() }
+    func showNotesWindow() {
+        if let notesWindow { NSApp.activate(ignoringOtherApps: true); notesWindow.makeKeyAndOrderFront(nil); return }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1050, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.minSize = NSSize(width: 900, height: 650)
+        window.title = "My Wispr — Note"; window.isReleasedWhenClosed = false; window.delegate = self
+        window.contentView = NSHostingView(rootView: NotesView(model: model, store: model.notes))
+        window.center(); notesWindow = window
+        NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil)
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if model.noteRecordingID != nil { model.stopFromButton() }
+        model.notes.save(); return true
+    }
     private var panel: NSPanel?
+    private var clipboardOrigin: NSPoint?
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 148, height: 48), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        model.openNotes = { [weak self] in self?.showNotesWindow() }
+        let panel = MovableNotchPanel(contentRect: NSRect(x: 0, y: 0, width: 180, height: 48), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.title = "My Wispr — Notch"
         panel.hasShadow = false; panel.hidesOnDeactivate = false; panel.isOpaque = false; panel.backgroundColor = .clear; panel.level = .floating; panel.ignoresMouseEvents = false
         panel.becomesKeyOnlyIfNeeded = true
+        panel.canDrag = { [weak self] in self?.model.showsCopyPreview == false && self?.model.showsClipboard == false }
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.contentView = NSHostingView(rootView: RecordingHUD(model: model)); self.panel = panel
-        model.showHUD = { [weak panel] in
-            if let screen = NSScreen.main { panel?.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - 74, y: screen.visibleFrame.minY + 12)) }
-            panel?.orderFrontRegardless()
+        let hosting = NSHostingView(rootView: RecordingHUD(model: model))
+        hosting.sizingOptions = []
+        panel.contentView = hosting; self.panel = panel
+        panel.isReleasedWhenClosed = false
+        model.resetHUDPosition = { [weak self, weak panel] in
+            guard let self, let panel, let screen = self.model.notchScreen else { return }
+            UserDefaults.standard.removeObject(forKey: "notchCenterX")
+            UserDefaults.standard.removeObject(forKey: "notchBottomY")
+            panel.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - panel.frame.width / 2, y: screen.visibleFrame.minY + 12))
+        }
+        if let screen = model.notchScreen {
+            let defaults = UserDefaults.standard
+            let x = defaults.object(forKey: "notchCenterX") as? Double ?? screen.visibleFrame.midX
+            let y = defaults.object(forKey: "notchBottomY") as? Double ?? screen.visibleFrame.minY + 12
+            let savedFrame = NSRect(x: x - 90, y: y, width: 180, height: 48)
+            if screen.visibleFrame.contains(savedFrame) {
+                panel.setFrameOrigin(savedFrame.origin)
+            } else { model.resetHUDPosition?() }
+        }
+        model.showHUD = { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(panel.frame) }) { self.model.resetHUDPosition?() }
+            panel.orderFrontRegardless()
         }
         model.hideHUD = { [weak panel] in
             guard let panel else { return }
             let center = panel.frame.midX; let bottom = panel.frame.minY
             panel.ignoresMouseEvents = false
-            panel.setFrame(NSRect(x: center - 74, y: bottom, width: 148, height: 48), display: true)
+            panel.setFrame(NSRect(x: center - 90, y: bottom, width: 180, height: 48), display: true)
             panel.orderFrontRegardless()
         }
         model.showHintHUD = { [weak panel] in
             guard let panel else { return }
             let center = panel.frame.midX; let bottom = panel.frame.minY
-            panel.setFrame(NSRect(x: center - 185, y: bottom, width: 370, height: 68), display: true)
+            panel.setFrame(NSRect(x: center - 205, y: bottom, width: 410, height: 68), display: true)
             panel.orderFrontRegardless()
         }
         model.showCopyHUD = { [weak panel] in
@@ -1008,6 +1273,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panel.setFrame(NSRect(x: center - 210, y: bottom, width: 420, height: 240), display: true)
             panel.ignoresMouseEvents = false
             panel.orderFrontRegardless()
+        }
+        panel.keyboardAction = { [weak self] code in self?.model.clipboardKey(code) }
+        panel.acceptsKeyboard = { [weak self] in self?.model.showsClipboard == true }
+        model.showClipboardHUD = { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            self.clipboardOrigin = panel.frame.origin
+            let center = panel.frame.midX, bottom = panel.frame.minY
+            let screen = panel.screen?.visibleFrame ?? NSScreen.main!.visibleFrame
+            let frame = NSRect(x: min(max(center - 190, screen.minX), screen.maxX - 380), y: min(bottom, screen.maxY - 360), width: 380, height: 360)
+            let source = NSPoint(x: center + self.model.clipboardButtonOffset, y: bottom + self.model.clipboardButtonHeight)
+            self.model.clipboardZoomAnchor = UnitPoint(x: (source.x - frame.minX - 15) / 350, y: 1 - (source.y - frame.minY - 6) / 320)
+            panel.setFrame(frame, display: true)
+            Task { @MainActor [weak panel] in
+                await Task.yield()
+                panel?.makeKeyAndOrderFront(nil)
+            }
+        }
+        model.closeClipboardHUD = { [weak self, weak panel] in
+            panel?.resignKey()
+            Task { @MainActor [weak self, weak panel] in
+                try? await Task.sleep(for: .milliseconds(350))
+                guard let self, !self.model.showsClipboard else { return }
+                self.model.hideHUD?()
+                if let origin = self.clipboardOrigin { panel?.setFrameOrigin(origin) }
+                self.clipboardOrigin = nil
+            }
         }
         model.showHUD?()
         model.installShortcut()
@@ -1019,15 +1310,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct MyWisprApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    private func menuLabel(_ title: String, icon: String) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            if let url = Bundle.main.url(forResource: "lucide-" + icon, withExtension: "png"), let image = NSImage(contentsOf: url) {
+                let _ = { image.size = NSSize(width: 16, height: 16); image.isTemplate = true }()
+                Image(nsImage: image)
+            }
+        }
+    }
     var body: some Scene {
         WindowGroup("My Wispr") { Dashboard(model: delegate.model) }.defaultSize(width: 1120, height: 850)
             .windowToolbarStyle(.unifiedCompact)
         MenuBarExtra("My Wispr", systemImage: "waveform") {
-            Button("Apri statistiche") { NSApp.activate(ignoringOtherApps: true); NSApp.windows.first(where: { !($0 is NSPanel) })?.makeKeyAndOrderFront(nil) }
-            Text(delegate.model.message)
-            Button("Abilita permessi", action: delegate.model.permissions)
+            Button { NSApp.activate(ignoringOtherApps: true); NSApp.windows.first(where: { $0.title == "My Wispr" && !($0 is NSPanel) })?.makeKeyAndOrderFront(nil) } label: { menuLabel("Statistiche", icon: "chart") }
+            Button { delegate.showNotesWindow() } label: { menuLabel("Notetaker", icon: "notes") }
+            Button(action: delegate.model.openClipboard) { menuLabel("Appunti", icon: "clipboard") }.disabled(!delegate.model.clipboardEnabled)
             Divider()
-            Button("Esci") { NSApp.terminate(nil) }
+            Button { delegate.model.resetHUDPosition?(); delegate.model.showHUD?() } label: { Label("Ripristina notch", systemImage: "arrow.counterclockwise") }
+            Button(action: delegate.model.permissions) { Label("Permessi", systemImage: "lock.shield") }
+            Divider()
+            Button { NSApp.terminate(nil) } label: { Label("Esci", systemImage: "rectangle.portrait.and.arrow.right") }
         }
     }
 }
@@ -1062,6 +1366,13 @@ struct SettingsDialog: View {
                                 Button(model.capturingShortcut ? "Annulla" : "Modifica") { model.capturingShortcut.toggle() }.buttonStyle(DashboardButtonStyle())
                             }
                             Divider()
+                            settingRow("Scorciatoia appunti", subtitle: model.captureClipboardBinding ? "Premi una combinazione di tasti." : (model.clipboardBinding?.label ?? "Doppio Shift")) {
+                                HStack {
+                                    Button("Modifica") { model.captureClipboardBinding = true; model.capturingShortcut = true }.buttonStyle(DashboardButtonStyle())
+                                    Button("Doppio Shift") { model.clipboardBinding = nil; UserDefaults.standard.removeObject(forKey: "clipboardBinding") }.buttonStyle(DashboardButtonStyle())
+                                }
+                            }
+                            Divider()
                             settingRow("Lingua di dettatura", subtitle: "Il modello vocale viene preparato per la lingua scelta.") {
                                 Picker("Lingua", selection: $model.language) { Text("Italiano").tag("it-IT"); Text("English").tag("en-US") }.labelsHidden().frame(width: 135)
                             }
@@ -1074,6 +1385,15 @@ struct SettingsDialog: View {
                                 Picker("Silenzio", selection: $model.silenceSeconds) { Text("Disattivato").tag(0.0); Text("5 secondi").tag(5.0); Text("10 secondi").tag(10.0); Text("20 secondi").tag(20.0); Text("30 secondi").tag(30.0) }.labelsHidden().frame(width: 135)
                             }
                         } else {
+                            settingRow("Schermo del notch", subtitle: "Scegli dove visualizzare il notch.") {
+                                Picker("Schermo", selection: $model.notchScreenID) {
+                                    Text("Schermo principale").tag("")
+                                    ForEach(NSScreen.screens, id: \.self) { screen in Text(screen.localizedName).tag(Dictation.screenID(screen)) }
+                                }.labelsHidden().frame(width: 180)
+                            }
+                            Divider()
+                            Button("Ripristina posizione del notch") { model.resetHUDPosition?(); model.showHUD?() }.buttonStyle(DashboardButtonStyle()).padding(.vertical, 14)
+                            Divider()
                             loginSection
                             settingRow("Microfono", subtitle: model.microphoneAllowed ? "Autorizzato" : "Necessario per registrare la tua voce.") {
                                 Button("Apri impostazioni", action: model.authorizeMicrophone).buttonStyle(DashboardButtonStyle())
@@ -1121,4 +1441,69 @@ struct SettingsDialog: View {
             control()
         }.padding(.vertical, 19)
     }
+}
+
+struct ClipboardPage: View {
+    @ObservedObject var model: Dictation
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Text("Appunti").font(.system(size: 28, weight: .medium, design: .serif))
+            HStack(alignment: .center) {
+                Text("Cronologia appunti").font(.headline)
+                Spacer()
+                Toggle("Abilita", isOn: $model.clipboardEnabled).labelsHidden().toggleStyle(.switch)
+            }
+            HStack(alignment: .center) { Text("Ultimi appunti").font(.headline); Spacer(); Button("Svuota") { model.clipboardItems = [] }.buttonStyle(DashboardButtonStyle()).disabled(model.clipboardItems.isEmpty) }
+            ForEach(Array(model.clipboardItems.enumerated()), id: \.offset) { _, text in
+                Text(text).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading).padding(14).background(Color.black.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+            }
+        }.padding(36)
+    }
+}
+struct ClipboardPopup: View {
+    @ObservedObject var model: Dictation
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack { Spacer(); Button { model.closeClipboard() } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }.buttonStyle(NotchButtonStyle()).accessibilityLabel("Chiudi appunti") }
+            if model.clipboardItems.isEmpty { LucideIcon(name: "clipboard", size: 26).foregroundStyle(.secondary).accessibilityLabel("Nessun appunto").frame(maxWidth: .infinity, maxHeight: .infinity) }
+            else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 4) {
+                            ForEach(Array(model.clipboardItems.enumerated()), id: \.offset) { index, text in
+                                Button { model.clipboardSelection = index; model.pasteClipboard() } label: {
+                                    Text(text).font(.system(size: 13)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                                        .background(.white.opacity(model.clipboardSelection == index ? 0.14 : 0.035), in: RoundedRectangle(cornerRadius: 10))
+                                }.buttonStyle(.plain).id(index)
+                            }
+                        }
+                    }.onChange(of: model.clipboardSelection) { _, index in withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(index) } }
+                }
+            }
+        }.padding(16).frame(width: 350, height: 320).foregroundStyle(.primary)
+            .background(ClipboardGlassBackdrop().clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous)))
+            .preferredColorScheme(.dark)
+    }
+}
+
+struct LucideIcon: View {
+    let name: String
+    var size: CGFloat = 20
+    var body: some View {
+        if let url = Bundle.main.url(forResource: "lucide-" + name, withExtension: "png"), let image = NSImage(contentsOf: url) {
+            Image(nsImage: image).renderingMode(.template).resizable().scaledToFit().frame(width: size, height: size)
+        }
+    }
+}
+
+struct ClipboardGlassBackdrop: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .hudWindow
+        view.blendingMode = .behindWindow
+        view.state = .active
+        view.appearance = NSAppearance(named: .darkAqua)
+        return view
+    }
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
 }
