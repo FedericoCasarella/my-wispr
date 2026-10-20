@@ -15,6 +15,29 @@ struct Usage: Codable, Identifiable {
     var text: String? = nil
 }
 
+// Aggregates are derived once per history change, not on every Dashboard render.
+struct UsageStats {
+    var totalWords = 0
+    var totalSeconds = 0.0
+    var averageLatency: Double?
+    var dailyWords: [Date: Int] = [:]
+    var maxDailyWords = 1
+    var streak = 0
+    init() {}
+    init(_ history: [Usage]) {
+        let calendar = Calendar.current
+        for usage in history {
+            totalWords += usage.words; totalSeconds += usage.duration
+            dailyWords[calendar.startOfDay(for: usage.date), default: 0] += usage.words
+        }
+        averageLatency = history.isEmpty ? nil : history.reduce(0) { $0 + $1.latency } / Double(history.count)
+        maxDailyWords = max(1, dailyWords.values.max() ?? 1)
+        var date = calendar.startOfDay(for: Date())
+        if dailyWords[date] == nil { date = calendar.date(byAdding: .day, value: -1, to: date)! }
+        while dailyWords[date] != nil { streak += 1; date = calendar.date(byAdding: .day, value: -1, to: date)! }
+    }
+}
+
 struct ShortcutBinding: Codable {
     var keyCode: UInt16
     var modifiers: UInt
@@ -62,7 +85,7 @@ final class Dictation: ObservableObject {
         clipboardSelection = 0
         showClipboardHUD?()
         showsClipboard = true
-        if soundEnabled { clipboardSound?.stop(); clipboardSound?.volume = 0.7; clipboardSound?.play() }
+        if soundEnabled { clipboardSound.play() }
     }
     func closeClipboard() {
         guard showsClipboard else { return }
@@ -120,8 +143,12 @@ final class Dictation: ObservableObject {
         start(fromButton: true)
         if !isStarting && phase == .idle { noteRecordingID = nil }
     }
-    @Published var transcript = "" {
-        didSet {
+    let transcriptionState = TranscriptionState()
+    private let responsiveness = UIResponsivenessMonitor()
+    var transcript: String {
+        get { transcriptionState.text }
+        set {
+            transcriptionState.text = newValue
             if let id = noteRecordingID {
                 notes.update(id) { note in
                     note.body = noteBase + (noteBase.isEmpty || transcript.isEmpty ? "" : "\n\n") + transcript
@@ -130,7 +157,11 @@ final class Dictation: ObservableObject {
             }
         }
     }
-    @Published var audioLevel: Double = 0
+    let recordingMeter = RecordingMeter()
+    var audioLevel: Double {
+        get { recordingMeter.level }
+        set { recordingMeter.level = newValue }
+    }
     @Published var showsCopyPreview = false
     @Published var previewCopied = false
     @Published var notchNotice: String?
@@ -138,7 +169,8 @@ final class Dictation: ObservableObject {
     private var hintTask: Task<Void, Never>?
     private var pressedAt = ContinuousClock.now
     private var heldShortcut = "fn"
-    @Published var history: [Usage] = []
+    @Published var history: [Usage] = [] { didSet { usageStats = UsageStats(history) } }
+    private(set) var usageStats = UsageStats()
     @Published var shortcut = (UserDefaults.standard.data(forKey: "shortcut").flatMap { try? JSONDecoder().decode(ShortcutBinding.self, from: $0) }) ?? .fn {
         didSet { if let data = try? JSONEncoder().encode(shortcut) { UserDefaults.standard.set(data, forKey: "shortcut") } }
     }
@@ -151,8 +183,10 @@ final class Dictation: ObservableObject {
     @Published private(set) var loginError: String?
     func refreshLoginStatus() {
         let status = SMAppService.mainApp.status
-        launchAtLogin = status == .enabled || status == .requiresApproval
-        loginNeedsApproval = status == .requiresApproval
+        let enabled = status == .enabled || status == .requiresApproval
+        let approval = status == .requiresApproval
+        if launchAtLogin != enabled { launchAtLogin = enabled }
+        if loginNeedsApproval != approval { loginNeedsApproval = approval }
     }
     func setLaunchAtLogin(_ enabled: Bool) {
         loginError = nil
@@ -163,9 +197,13 @@ final class Dictation: ObservableObject {
         refreshLoginStatus()
     }
     @Published var language = UserDefaults.standard.string(forKey: "language") ?? "it-IT"
-    private let engine = AVAudioEngine()
-    private let clipboardSound: NSSound? = Bundle.main.url(forResource: "clipboard-open", withExtension: "wav").flatMap { NSSound(contentsOf: $0, byReference: false) }
-    private let startSound: NSSound? = Bundle.main.url(forResource: "recording-start", withExtension: "wav").flatMap { NSSound(contentsOf: $0, byReference: false) }
+    @Published var preferBuiltInWithBluetooth = UserDefaults.standard.object(forKey: "preferBuiltInWithBluetooth") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(preferBuiltInWithBluetooth, forKey: "preferBuiltInWithBluetooth") }
+    }
+    private var meterTask: Task<Void, Never>?
+    private var microphoneCapture: MicrophoneCapture?
+    private let clipboardSound = SoundCue(resource: "clipboard-open")
+    private let startSound = SoundCue(resource: "recording-start")
     @Published var microphoneAllowed = false
     @Published var accessibilityAllowed = false
     @Published var modelReady = false
@@ -188,8 +226,9 @@ final class Dictation: ObservableObject {
     private var stopped = Date()
     private var target: NSRunningApplication?
     private var focusedField: AXUIElement?
+    private var deliveryPreparation: Task<PreparedDelivery, Never>?
+    private var deliveringSession: UUID?
     private var insertionMessage = ""
-    private var tapInstalled = false
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var keyDown = false
@@ -210,15 +249,26 @@ final class Dictation: ObservableObject {
     var hideHUD: (() -> Void)?
     var showCopyHUD: (() -> Void)?
     var showHintHUD: (() -> Void)?
+    private let persistence = DispatchQueue(label: "MyWispr.persistence", qos: .utility)
     private let storage = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("MyWispr/usage.json")
 
     init() {
         if let data = try? Data(contentsOf: storage), let saved = try? JSONDecoder().decode([Usage].self, from: data) { history = saved }
+        usageStats = UsageStats(history)
     }
     func installShortcut() {
         refreshPermissions()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { @Sendable [weak self] _ in
-            Task { @MainActor in self?.refreshPermissions(); self?.pollClipboard() }
+            Task { @MainActor in
+                let snapshot = await PermissionSnapshot.read()
+                guard let self else { return }
+                if self.microphoneAllowed != snapshot.microphone { self.microphoneAllowed = snapshot.microphone }
+                if self.accessibilityAllowed != snapshot.accessibility { self.accessibilityAllowed = snapshot.accessibility }
+                if self.launchAtLogin != snapshot.launchAtLogin { self.launchAtLogin = snapshot.launchAtLogin }
+                if self.loginNeedsApproval != snapshot.loginNeedsApproval { self.loginNeedsApproval = snapshot.loginNeedsApproval }
+                if self.accessibilityAllowed { self.installMediaObserver() }
+                self.pollClipboard()
+            }
         }
         clipboardTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { @Sendable [weak self] _ in Task { @MainActor in self?.pollClipboard() } }
         prepareModel()
@@ -353,8 +403,10 @@ final class Dictation: ObservableObject {
     }
     func refreshPermissions() {
         refreshLoginStatus()
-        microphoneAllowed = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-        accessibilityAllowed = AXIsProcessTrusted()
+        let microphone = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        let accessibility = AXIsProcessTrusted()
+        if microphoneAllowed != microphone { microphoneAllowed = microphone }
+        if accessibilityAllowed != accessibility { accessibilityAllowed = accessibility }
         if accessibilityAllowed { installMediaObserver() }
     }
     func authorizeMicrophone() {
@@ -391,24 +443,10 @@ final class Dictation: ObservableObject {
         setupTask = Task { [weak self] in
             guard let self else { return }
             do {
-                guard SpeechTranscriber.isAvailable,
-                      let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: selectedLanguage)) else {
-                    throw NSError(domain: "MyWispr", code: 1, userInfo: [NSLocalizedDescriptionKey: "Lingua non supportata dal motore locale."])
-                }
-                let module = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [.volatileResults, .fastResults], attributeOptions: [])
-                try await AssetInventory.reserve(locale: locale)
-                if let installation = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
-                    self.modelStatus = "Download del modello vocale…"
-                    try await installation.downloadAndInstall()
-                }
-                guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module]) else {
-                    throw NSError(domain: "MyWispr", code: 2, userInfo: [NSLocalizedDescriptionKey: "Formato audio non disponibile."])
-                }
-                let analyzer = SpeechAnalyzer(modules: [module])
-                try await analyzer.prepareToAnalyze(in: format)
+                let prepared = try await SpeechPreparation.prepare(language: selectedLanguage)
                 try Task.checkCancellation()
                 guard self.language == selectedLanguage else { return }
-                self.transcriber = module; self.audioFormat = format; self.analyzer = analyzer
+                self.transcriber = prepared.module; self.audioFormat = prepared.format; self.analyzer = prepared.analyzer
                 self.modelReady = true; self.modelStatus = "Modello locale pronto"
 
             } catch {
@@ -421,18 +459,29 @@ final class Dictation: ObservableObject {
     func startFromButton() { start(fromButton: true) }
     func stopFromButton() { stop() }
     func start(fromButton: Bool = false) {
-        guard phase == .idle, pendingStart == nil else { return }
+        guard phase == .idle, pendingStart == nil, !isStarting else { return }
+        responsiveness.start()
         hintTask?.cancel(); holdHint = nil
-        refreshPermissions()
-        guard microphoneAllowed else { message = "Abilita il microfono nelle Impostazioni di Sistema."; return }
-        guard modelReady, let transcriber, let analyzer, let audioFormat else { message = modelStatus; return }
+        guard microphoneAllowed else { responsiveness.stop(); message = "Abilita il microfono nelle Impostazioni di Sistema."; return }
+        guard modelReady, let transcriber, let analyzer, let audioFormat else { responsiveness.stop(); message = modelStatus; return }
         buttonRecording = fromButton
         isStarting = true
         dismissCopyPreview()
         target = NSWorkspace.shared.frontmostApplication
-        focusedField = target.flatMap { editableField(from: focusedElement(in: $0)) }
+        focusedField = nil
         transcript = ""; committedText = ""
         let token = UUID(); session = token
+        if let app = target {
+            let captured = FocusApplication(app: app)
+            Task { [weak self] in
+                guard let self else { return }
+                let field = await Task.detached(priority: .userInitiated) {
+                    FocusElement(value: self.editableField(from: self.focusedElement(in: captured.app, enableAccessibility: true)))
+                }.value
+                guard self.session == token, self.phase != .idle || self.isStarting else { return }
+                self.focusedField = field.value
+            }
+        }
         let (stream, sink) = AsyncStream<AnalyzerInput>.makeStream()
         continuation = sink
         resultsTask = Task { [weak self] in
@@ -460,40 +509,33 @@ final class Dictation: ObservableObject {
                     self.continuation?.finish(); self.pendingStart = nil; self.isStarting = false; self.buttonRecording = false
                     self.resultsTask?.cancel(); await analyzer.cancelAndFinishNow(); self.prepareModel(); return
                 }
-                let input = self.engine.inputNode
-                let format = input.outputFormat(forBus: 0)
-                guard format.sampleRate > 0, format.channelCount > 0,
-                      let converter = AudioStreamConverter(from: format, to: audioFormat, sink: sink) else {
-                    throw NSError(domain: "MyWispr", code: 3, userInfo: [NSLocalizedDescriptionKey: "Microfono o conversione audio non disponibile."])
-                }
-                input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable [weak self] buffer, _ in
-                    do { try converter.append(buffer) }
-                    catch {
-                        let reason = error.localizedDescription
-                        Task { @MainActor in
-                            guard let self, self.session == token else { return }
-                            self.abort("Errore audio: \(reason)")
-                        }
-                    }
-                    guard let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
-                    var sum: Float = 0
-                    for index in 0..<Int(buffer.frameLength) { sum += samples[index] * samples[index] }
-                    let rms = sqrt(sum / Float(buffer.frameLength))
-                    let level = min(1, max(0, (Double(20 * log10(max(rms, 0.00001))) + 55) / 45))
+                let meter = AudioLevelMailbox()
+                let capture = MicrophoneCapture(outputFormat: audioFormat, sink: sink, meter: meter) { @Sendable [weak self] reason in
                     Task { @MainActor in
-                        guard let self, self.session == token, self.phase == .recording else { return }
-                        self.audioLevel = level
-                        if level > 0.22 { self.lastSound = .now }
+                        guard let self, self.session == token else { return }
+                        self.abort("Errore audio: \(reason)")
                     }
                 }
-                self.tapInstalled = true
-                self.engine.prepare(); try self.engine.start()
+                self.microphoneCapture = capture
+                try await capture.start(preferBuiltIn: self.preferBuiltInWithBluetooth)
+                guard self.session == token, !Task.isCancelled, (self.keyDown || self.buttonRecording) else {
+                    capture.stop()
+                    if self.session == token { self.abort("Registrazione annullata.") }
+                    return
+                }
                 self.started = Date(); self.phase = .recording; self.message = "Ti ascolto…"; self.showHUD?()
                 self.lastSound = .now
+                self.meterTask = Task { @MainActor [weak self] in
+                    while !Task.isCancelled {
+                        do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+                        guard let self, self.session == token, self.phase == .recording else { return }
+                        let (level, sound) = meter.snapshot()
+                        if abs(self.audioLevel - level) > 0.02 { self.audioLevel = level }
+                        if sound > self.lastSound { self.lastSound = sound }
+                    }
+                }
                 self.startSilenceWatchdog(token: token)
-                self.startSound?.stop()
-                self.startSound?.volume = 0.7
-                if self.soundEnabled { self.startSound?.play() }
+                if self.soundEnabled { self.startSound.play() }
                 self.pendingStart = nil; self.isStarting = false
             } catch {
                 guard self.session == token, !Task.isCancelled else { return }
@@ -508,10 +550,38 @@ final class Dictation: ObservableObject {
         if let pendingStart { pendingStart.cancel(); return }
         guard phase == .recording, let analyzer else { return }
         stopped = Date(); phase = .finishing; message = "Sto completando…"
-        stopAudio(); continuation?.finish(); continuation = nil
+        let capturedApp = target.map { FocusApplication(app: $0) }
+        let cachedField = FocusElement(value: focusedField)
+        deliveryPreparation = Task.detached(priority: .userInitiated) { [self] in
+            let begin = Date()
+            var field: AXUIElement?
+            if let app = capturedApp {
+                field = editableField(from: focusedElement(in: app.app))
+                if field == nil, let cached = cachedField.value {
+                    AXUIElementSetMessagingTimeout(cached, 0.2)
+                    var focus: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(cached, kAXFocusedAttribute as CFString, &focus) == .success, focus as? Bool == true { field = cached }
+                }
+            }
+            var secure = false
+            if let field {
+                AXUIElementSetMessagingTimeout(field, 0.2)
+                var subrole: CFTypeRef?
+                _ = AXUIElementCopyAttributeValue(field, kAXSubroleAttribute as CFString, &subrole)
+                secure = subrole as? String == kAXSecureTextFieldSubrole
+            }
+            return PreparedDelivery(field: field, secure: secure, clipboard: ClipboardBackup.read(), preparationSeconds: Date().timeIntervalSince(begin))
+        }
+        let capture = microphoneCapture
+        let audioSink = continuation
+        continuation = nil
+        stopAudio(releaseCapture: false)
         let token = session
         deadline = Task { [weak self] in
             do {
+                await capture?.finish()
+                audioSink?.finish()
+                guard self?.session == token, !Task.isCancelled else { return }
                 try await analyzer.finalizeAndFinishThroughEndOfInput()
                 await self?.resultsTask?.value
                 self?.finish(token: token)
@@ -535,31 +605,58 @@ final class Dictation: ObservableObject {
             }
         }
     }
-    private func stopAudio() {
+    private func stopAudio(releaseCapture: Bool = true) {
+        meterTask?.cancel(); meterTask = nil
         silenceTask?.cancel(); silenceTask = nil
         audioLevel = 0
-        engine.stop()
-        if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+        if releaseCapture { microphoneCapture?.stop() }
+        microphoneCapture = nil
     }
     private func finish(token: UUID) {
-        guard session == token, phase == .finishing else { return }
+        guard session == token, phase == .finishing, deliveringSession != token else { return }
+        deliveringSession = token
         let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        let latency = Date().timeIntervalSince(stopped)
+        let recognitionSeconds = Date().timeIntervalSince(stopped)
         deadline?.cancel(); deadline = nil
         resultsTask?.cancel(); resultsTask = nil; analyzer = nil; transcriber = nil
-        phase = .idle; hideHUD?(); prepareModel()
-        guard !text.isEmpty else { noteRecordingID = nil; notes.save(); message = "Nessuna parola riconosciuta. Riprova."; return }
-        if noteRecordingID != nil { noteRecordingID = nil; notes.save(); message = "Nota salvata."; return }
-        let inserted = insert(text)
-        if !inserted { showsCopyPreview = true; showCopyHUD?() }
-        history.insert(Usage(date: Date(), words: text.split(whereSeparator: { $0.isWhitespace }).count, duration: stopped.timeIntervalSince(started), latency: latency, inserted: inserted, text: text), at: 0)
-        do {
-            try FileManager.default.createDirectory(at: storage.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONEncoder().encode(history).write(to: storage, options: .atomic)
-            message = insertionMessage
-        } catch { message = "Testo pronto. Statistiche non salvate: \(error.localizedDescription)" }
+        if text.isEmpty || noteRecordingID != nil {
+            noteRecordingID = nil; notes.save(); phase = .idle; hideHUD?(); prepareModel()
+            message = text.isEmpty ? "Nessuna parola riconosciuta. Riprova." : "Nota salvata."
+            deliveryPreparation?.cancel(); deliveryPreparation = nil; return
+        }
+        let preparation = deliveryPreparation
+        Task { @MainActor [weak self] in
+            let prepared = await preparation?.value
+            guard let self, self.session == token, self.phase == .finishing else { return }
+            let insertionStarted = Date()
+            let inserted = self.insert(text, prepared: prepared)
+            let totalSeconds = Date().timeIntervalSince(self.stopped)
+            // The notch stays open until paste has actually been dispatched.
+            self.phase = .idle; self.hideHUD?()
+            if !inserted { self.showsCopyPreview = true; self.showCopyHUD?() }
+            self.history.insert(Usage(date: Date(), words: text.split(whereSeparator: { $0.isWhitespace }).count, duration: self.stopped.timeIntervalSince(self.started), latency: totalSeconds, inserted: inserted, text: text), at: 0)
+            self.deliveryPreparation = nil
+            let timings: [String: Double] = ["recognition_seconds": recognitionSeconds, "preparation_seconds": prepared?.preparationSeconds ?? 0, "insertion_seconds": Date().timeIntervalSince(insertionStarted), "release_to_paste_seconds": totalSeconds, "largest_ui_stall_seconds": self.responsiveness.largestDelay]
+            self.message = self.insertionMessage
+            let history = self.history, storage = self.storage
+            // Encoding and atomically writing the full history is too slow for the UI thread.
+            self.persistence.async {
+                do {
+                    try FileManager.default.createDirectory(at: storage.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try JSONEncoder().encode(history).write(to: storage, options: .atomic)
+                    try JSONSerialization.data(withJSONObject: timings, options: .prettyPrinted).write(to: storage.deletingLastPathComponent().appendingPathComponent("last-delivery-timing.json"), options: .atomic)
+                } catch {
+                    let reason = error.localizedDescription
+                    Task { @MainActor [weak self] in self?.message = "Testo pronto. Statistiche non salvate: \(reason)" }
+                }
+            }
+            self.prepareModel()
+            self.responsiveness.stop()
+        }
     }
     private func abort(_ reason: String) {
+        responsiveness.stop()
+        deliveryPreparation?.cancel(); deliveryPreparation = nil
         noteRecordingID = nil; notes.save()
         buttonRecording = false; isStarting = false
         session = UUID(); pendingStart?.cancel(); pendingStart = nil; deadline?.cancel(); stopAudio()
@@ -568,11 +665,14 @@ final class Dictation: ObservableObject {
         analyzer = nil; transcriber = nil
         phase = .idle; hideHUD?(); prepareModel(); message = reason
     }
-    private func focusedElement(in app: NSRunningApplication) -> AXUIElement? {
+    nonisolated private func focusedElement(in app: NSRunningApplication, enableAccessibility: Bool = false) -> AXUIElement? {
         let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.2)
         // Electron and Chromium lazily expose their editable accessibility tree.
-        _ = AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        _ = AXUIElementSetAttributeValue(application, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        if enableAccessibility {
+            _ = AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            _ = AXUIElementSetAttributeValue(application, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        }
         var value: CFTypeRef?
         if AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &value) == .success,
            let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
@@ -586,7 +686,7 @@ final class Dictation: ObservableObject {
         guard AXUIElementGetPid(element, &pid) == .success, pid == app.processIdentifier else { return nil }
         return element
     }
-    private func editableField(from element: AXUIElement?) -> AXUIElement? {
+    nonisolated private func editableField(from element: AXUIElement?) -> AXUIElement? {
         guard let element else { return nil }
         if isEditableField(element) { return element }
         // Some web editors report an inner focus node instead of their text area.
@@ -600,12 +700,12 @@ final class Dictation: ObservableObject {
         }
         return nil
     }
-    private func fieldValue(_ field: AXUIElement) -> String? {
+    nonisolated private func fieldValue(_ field: AXUIElement) -> String? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(field, kAXValueAttribute as CFString, &value) == .success else { return nil }
         return value as? String
     }
-    private func isEditableField(_ field: AXUIElement) -> Bool {
+    nonisolated private func isEditableField(_ field: AXUIElement) -> Bool {
         var role: CFTypeRef?
         _ = AXUIElementCopyAttributeValue(field, kAXRoleAttribute as CFString, &role)
         var editable: CFTypeRef?
@@ -620,8 +720,7 @@ final class Dictation: ObservableObject {
         if AXUIElementCopyAttributeValue(field, "AXSelectedTextMarkerRange" as CFString, &selectedRange) == .success { return true }
         return false
     }
-    private func insert(_ text: String) -> Bool {
-        refreshPermissions()
+    private func insert(_ text: String, prepared: PreparedDelivery? = nil) -> Bool {
         guard accessibilityAllowed else {
             insertionMessage = "Trascrizione pronta. Abilita Accessibilità per My Wispr per inserirla nelle altre app."
             return false
@@ -634,35 +733,13 @@ final class Dictation: ObservableObject {
             insertionMessage = "L’app attiva è cambiata: la trascrizione resta disponibile con Copia."
             return false
         }
-        // Use the current caret in the original app; the nonactivating HUD never owns focus.
-        var field = editableField(from: focusedElement(in: target))
-        if field == nil, let captured = focusedField {
-            var focused: CFTypeRef?
-            if AXUIElementCopyAttributeValue(captured, kAXFocusedAttribute as CFString, &focused) == .success,
-               focused as? Bool == true { field = captured }
-        }
-        guard let field else {
+        guard let prepared, prepared.field != nil else {
             insertionMessage = "Nessun campo di testo attivo: la trascrizione è pronta da copiare."
             return false
         }
-        do {
-            var role: CFTypeRef?
-            _ = AXUIElementCopyAttributeValue(field, kAXSubroleAttribute as CFString, &role)
-            if role as? String == kAXSecureTextFieldSubrole {
-                insertionMessage = "La trascrizione è pronta; questo campo è protetto."
-                return false
-            }
-            var settable = DarwinBoolean(false)
-            if AXUIElementIsAttributeSettable(field, kAXSelectedTextAttribute as CFString, &settable) == .success, settable.boolValue {
-                let before = fieldValue(field)
-                if AXUIElementSetAttributeValue(field, kAXSelectedTextAttribute as CFString, text as CFString) == .success {
-                    let after = fieldValue(field)
-                    if before == nil || after == nil || before != after {
-                        insertionMessage = "Testo inserito in \(target.localizedName ?? "campo attivo")."
-                        return true
-                    }
-                }
-            }
+        if prepared.secure {
+            insertionMessage = "La trascrizione è pronta; questo campo è protetto."
+            return false
         }
         // Standard paste works with browser editors, Electron apps and rich text fields
         // that do not implement writable AXSelectedText or Unicode key events.
@@ -673,12 +750,10 @@ final class Dictation: ObservableObject {
             return false
         }
         let pasteboard = NSPasteboard.general
-        let previous = (pasteboard.pasteboardItems ?? []).map { item in
-            item.types.compactMap { type -> (NSPasteboard.PasteboardType, Data)? in
-                guard let data = item.data(forType: type) else { return nil }
-                return (type, data)
-            }
-        }
+        // Clipboard data providers may be slow (images, rich text). Resolve them
+        // off the UI thread in parallel with speech finalization, not at paste time.
+        let backup = prepared.clipboard.changeCount == pasteboard.changeCount ? prepared.clipboard : ClipboardBackup.read()
+        let previous = backup.items
         pasteboard.clearContents()
         guard pasteboard.setString(text, forType: .string) else {
             insertionMessage = "Impossibile preparare Incolla. Usa Copia dalla finestra."
@@ -691,7 +766,7 @@ final class Dictation: ObservableObject {
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(800))
             // Do not overwrite anything the user copied in the meantime.
-            guard pasteboard.changeCount == changeCount else { return }
+            guard pasteboard.changeCount == changeCount, !previous.isEmpty else { return }
             pasteboard.clearContents()
             let items = previous.map { values in
                 let item = NSPasteboardItem()
@@ -724,21 +799,12 @@ struct Dashboard: View {
     private let teal = Color(red: 0.12, green: 0.12, blue: 0.12)
     private let canvas = Color(white: 0.97)
     private let cardColor = Color(white: 0.985)
-    private var totalWords: Int { model.history.reduce(0) { $0 + $1.words } }
-    private var totalSeconds: Double { model.history.reduce(0) { $0 + $1.duration } }
+    private var totalWords: Int { model.usageStats.totalWords }
+    private var totalSeconds: Double { model.usageStats.totalSeconds }
     private var wpm: Int { totalSeconds > 0 ? Int(Double(totalWords) / totalSeconds * 60) : 0 }
-    private var latency: String { model.history.isEmpty ? "—" : String(format: "%.2f s", model.history.reduce(0) { $0 + $1.latency } / Double(model.history.count)) }
-    private var dailyWords: [Date: Int] {
-        Dictionary(grouping: model.history, by: { Calendar.current.startOfDay(for: $0.date) }).mapValues { $0.reduce(0) { $0 + $1.words } }
-    }
-    private var streak: Int {
-        let calendar = Calendar.current
-        var date = calendar.startOfDay(for: Date())
-        if dailyWords[date] == nil { date = calendar.date(byAdding: .day, value: -1, to: date)! }
-        var count = 0
-        while dailyWords[date] != nil { count += 1; date = calendar.date(byAdding: .day, value: -1, to: date)! }
-        return count
-    }
+    private var latency: String { model.usageStats.averageLatency.map { String(format: "%.2f s", $0) } ?? "—" }
+    private var dailyWords: [Date: Int] { model.usageStats.dailyWords }
+    private var streak: Int { model.usageStats.streak }
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 28) {
@@ -889,7 +955,8 @@ struct Dashboard: View {
         let calendar = Calendar.current
         let weekStart = calendar.dateInterval(of: .weekOfYear, for: Date())!.start
         let first = calendar.date(byAdding: .day, value: -77, to: weekStart)!
-        let maximum = max(1, dailyWords.values.max() ?? 1)
+        let maximum = model.usageStats.maxDailyWords
+        let dailyWords = dailyWords
         return HStack(spacing: 5) {
             ForEach(0..<12) { week in
                 VStack(spacing: 5) {
@@ -1086,13 +1153,7 @@ struct RecordingHUD: View {
                 } else {
                     if listening {
                         Image(systemName: "mic.fill").font(.system(size: 14, weight: .medium)).frame(width: 24, height: 24)
-                        HStack(spacing: 2.5) {
-                            ForEach(weights.indices, id: \.self) { index in
-                                Capsule(style: .continuous).fill(.white)
-                                    .frame(width: 3, height: reduceMotion ? 10 : 3 + 17 * model.audioLevel * weights[index])
-                            }
-                        }.frame(width: 40, height: 22)
-                            .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: model.audioLevel)
+                        RecordingWaveform(meter: model.recordingMeter)
                         if model.buttonRecording {
                         Button(action: model.stopFromButton) {
                             Image(systemName: "stop.fill").font(.system(size: 11, weight: .semibold))
@@ -1403,7 +1464,14 @@ struct SettingsDialog: View {
                                 Button("Apri impostazioni", action: model.authorizeAccessibility).buttonStyle(DashboardButtonStyle())
                             }
                             Divider()
-                            settingRow("Microfono di sistema", subtitle: "My Wispr usa il dispositivo di ingresso selezionato da macOS.") {
+                            settingRow("Microfono con cuffie Bluetooth", subtitle: "Usa il microfono del Mac per evitare il cambio di modalità Bluetooth. Le cuffie restano disponibili per l’ascolto.") {
+                                Picker("Microfono", selection: $model.preferBuiltInWithBluetooth) {
+                                    Text("Microfono del Mac").tag(true)
+                                    Text("Microfono di sistema").tag(false)
+                                }.labelsHidden().frame(width: 180).disabled(model.phase != .idle || model.isStarting)
+                            }
+                            Divider()
+                            settingRow("Microfono di sistema", subtitle: "Per cuffie cablate e USB viene mantenuto il dispositivo scelto da macOS.") {
                                 Button("Modifica") { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")!) }.buttonStyle(DashboardButtonStyle())
                             }
                         }
@@ -1506,4 +1574,29 @@ struct ClipboardGlassBackdrop: NSViewRepresentable {
         return view
     }
     func updateNSView(_ view: NSVisualEffectView, context: Context) {}
+}
+
+private struct FocusApplication: @unchecked Sendable { let app: NSRunningApplication }
+private struct FocusElement: @unchecked Sendable { let value: AXUIElement? }
+
+private struct PreparedDelivery: @unchecked Sendable {
+    let field: AXUIElement?
+    let secure: Bool
+    let clipboard: ClipboardBackup
+    let preparationSeconds: Double
+}
+private struct ClipboardBackup: @unchecked Sendable {
+    let changeCount: Int
+    let items: [[(NSPasteboard.PasteboardType, Data)]]
+    static func read() -> ClipboardBackup {
+        let board = NSPasteboard.general
+        let count = board.changeCount
+        let items = (board.pasteboardItems ?? []).map { item in
+            item.types.compactMap { type -> (NSPasteboard.PasteboardType, Data)? in
+                guard let data = item.data(forType: type) else { return nil }
+                return (type, data)
+            }
+        }
+        return ClipboardBackup(changeCount: count, items: items)
+    }
 }
