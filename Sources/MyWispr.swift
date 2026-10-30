@@ -181,7 +181,7 @@ final class Dictation: ObservableObject {
     @Published var capturingShortcut = false
     @Published var formattingEnabled = UserDefaults.standard.object(forKey: "formattingEnabled") as? Bool ?? true { didSet { UserDefaults.standard.set(formattingEnabled, forKey: "formattingEnabled") } }
     @Published private(set) var formatting = false
-    @Published var vocabulary = UserDefaults.standard.string(forKey: "vocabulary") ?? "AI, Claude, Supermemory" { didSet { UserDefaults.standard.set(vocabulary, forKey: "vocabulary") } }
+    @Published var vocabulary = UserDefaults.standard.string(forKey: "vocabulary") ?? "AI, agente, Claude, Supermemory" { didSet { UserDefaults.standard.set(vocabulary, forKey: "vocabulary") } }
     var vocabularyTerms: [String] { vocabulary.split(whereSeparator: { $0 == "," || $0.isNewline }).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
     private var formatterSession: LanguageModelSession?
     @Published private(set) var launchAtLogin = false
@@ -1472,7 +1472,7 @@ struct SettingsDialog: View {
                             }
                             Divider()
                             settingRow("Dizionario personale", subtitle: "Brand, nomi e termini tecnici separati da virgola. Migliorano riconoscimento e correzione (es. «AI» invece di «hai»).") {
-                                TextField("AI, Claude, Supermemory", text: $model.vocabulary)
+                                TextField("AI, agente, Claude, Supermemory", text: $model.vocabulary)
                                     .textFieldStyle(.roundedBorder).frame(width: 220)
                                     .onSubmit { model.prepareModel() }
                             }

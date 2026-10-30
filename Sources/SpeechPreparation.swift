@@ -26,7 +26,8 @@ enum SpeechPreparation {
         if !terms.isEmpty {
             // Biases recognition toward the user's brand names and jargon.
             let context = AnalysisContext()
-            context.contextualStrings[.general] = terms
+            // Elided forms help Italian nouns that sound like other phrases ("l'agente" vs "la gente").
+            context.contextualStrings[.general] = terms + terms.filter { $0.first.map { "aeiouAEIOU".contains($0) } == true }.map { "l'" + $0 }
             try await analyzer.setContext(context)
         }
         try await analyzer.prepareToAnalyze(in: format)

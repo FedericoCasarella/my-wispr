@@ -49,7 +49,7 @@ enum TextFormatter {
     }
     static func session(terms: [String] = []) -> LanguageModelSession? {
         guard SystemLanguageModel.default.availability == .available else { return nil }
-        let glossary = terms.isEmpty ? "" : "\n\nDizionario di chi parla. Scrivi questi termini esattamente così quando vengono pronunciati, anche se la trascrizione li ha sbagliati (es. «hai» invece di «AI», «super memory» invece di «Supermemory»), ma solo quando il contesto lo indica: " + terms.joined(separator: ", ")
+        let glossary = terms.isEmpty ? "" : "\n\nDizionario di chi parla. Scrivi questi termini esattamente così quando vengono pronunciati, anche se la trascrizione li ha sbagliati (es. «hai» invece di «AI», «super memory» invece di «Supermemory», «la gente» invece di «l’agente»), ma solo quando il contesto lo indica: " + terms.joined(separator: ", ")
         return LanguageModelSession(model: model, instructions: instructions + glossary)
     }
     static func run(_ text: String, session: LanguageModelSession, terms: [String] = [], timeout: Duration = .seconds(10)) async throws -> String {
