@@ -14,6 +14,7 @@ Autorizza Microfono e Accessibilità. Nelle impostazioni Tastiera di macOS scegl
 
 - Tieni premuto Fn per dettare e rilascia per inserire il testo nel campo attivo. Scorciatoia modificabile nelle impostazioni (Fn, Control, modificatori destri o combinazioni).
 - Formattazione intelligente prima dell’incolla: punteggiatura, grammatica, domande, elenchi puntati e paragrafi, con il modello Apple Intelligence sul Mac. Se il modello non è disponibile o altera il contenuto, viene incollata la trascrizione originale. Disattivabile nelle impostazioni.
+- Dizionario personale di brand e termini tecnici: orienta il riconoscimento vocale e la correzione (es. «AI» invece di «hai»).
 - Notch traslucido, trascinabile e configurabile per monitor; pulsanti di registrazione e appunti al passaggio del mouse.
 - Cronologia appunti attivabile: doppio Shift, frecce per scegliere, Invio per copiare e incollare. Conserva fino a 40 testi/link in memoria fino alla chiusura dell’app.
 - Dashboard con statistiche reali e trascrizioni paginate, dieci righe per pagina.

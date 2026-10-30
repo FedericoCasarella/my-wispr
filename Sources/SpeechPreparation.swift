@@ -11,7 +11,7 @@ struct PreparedSpeech: @unchecked Sendable {
     let format: AVAudioFormat
 }
 enum SpeechPreparation {
-    @concurrent static func prepare(language: String) async throws -> PreparedSpeech {
+    @concurrent static func prepare(language: String, terms: [String] = []) async throws -> PreparedSpeech {
         guard SpeechTranscriber.isAvailable,
               let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: language)) else {
             throw NSError(domain: "MyWispr", code: 1, userInfo: [NSLocalizedDescriptionKey: "Lingua non supportata dal motore locale."])
@@ -23,6 +23,12 @@ enum SpeechPreparation {
             throw NSError(domain: "MyWispr", code: 2, userInfo: [NSLocalizedDescriptionKey: "Formato audio non disponibile."])
         }
         let analyzer = SpeechAnalyzer(modules: [module], options: .init(priority: .userInitiated, modelRetention: .processLifetime))
+        if !terms.isEmpty {
+            // Biases recognition toward the user's brand names and jargon.
+            let context = AnalysisContext()
+            context.contextualStrings[.general] = terms
+            try await analyzer.setContext(context)
+        }
         try await analyzer.prepareToAnalyze(in: format)
         try Task.checkCancellation()
         return PreparedSpeech(module: module, analyzer: analyzer, format: format)

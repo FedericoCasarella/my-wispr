@@ -181,6 +181,8 @@ final class Dictation: ObservableObject {
     @Published var capturingShortcut = false
     @Published var formattingEnabled = UserDefaults.standard.object(forKey: "formattingEnabled") as? Bool ?? true { didSet { UserDefaults.standard.set(formattingEnabled, forKey: "formattingEnabled") } }
     @Published private(set) var formatting = false
+    @Published var vocabulary = UserDefaults.standard.string(forKey: "vocabulary") ?? "AI, Claude, Supermemory" { didSet { UserDefaults.standard.set(vocabulary, forKey: "vocabulary") } }
+    var vocabularyTerms: [String] { vocabulary.split(whereSeparator: { $0 == "," || $0.isNewline }).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
     private var formatterSession: LanguageModelSession?
     @Published private(set) var launchAtLogin = false
     @Published private(set) var loginNeedsApproval = false
@@ -444,11 +446,11 @@ final class Dictation: ObservableObject {
         guard phase == .idle else { return }
         setupTask?.cancel()
         modelReady = false; modelStatus = "Preparazione modello…"
-        let selectedLanguage = language
+        let selectedLanguage = language, terms = vocabularyTerms
         setupTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let prepared = try await SpeechPreparation.prepare(language: selectedLanguage)
+                let prepared = try await SpeechPreparation.prepare(language: selectedLanguage, terms: terms)
                 try Task.checkCancellation()
                 guard self.language == selectedLanguage else { return }
                 self.transcriber = prepared.module; self.audioFormat = prepared.format; self.analyzer = prepared.analyzer
@@ -476,7 +478,7 @@ final class Dictation: ObservableObject {
         focusedField = nil
         transcript = ""; committedText = ""
         // Load the on-device model while the user speaks so formatting starts warm.
-        formatterSession = formattingEnabled && noteRecordingID == nil ? TextFormatter.session() : nil
+        formatterSession = formattingEnabled && noteRecordingID == nil ? TextFormatter.session(terms: vocabularyTerms) : nil
         formatterSession?.prewarm()
         let token = UUID(); session = token
         if let app = target {
@@ -625,7 +627,7 @@ final class Dictation: ObservableObject {
         deliveringSession = token
         var text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         let recognitionSeconds = Date().timeIntervalSince(stopped)
-        let formatter = formatterSession
+        let formatter = formatterSession, terms = vocabularyTerms
         formatterSession = nil
         deadline?.cancel(); deadline = nil
         resultsTask?.cancel(); resultsTask = nil; analyzer = nil; transcriber = nil
@@ -640,7 +642,7 @@ final class Dictation: ObservableObject {
             if let formatter, text.split(whereSeparator: { $0.isWhitespace }).count > 2 {
                 self?.formatting = true; self?.message = "Sistemo il testo…"
                 // Any failure (timeout, guardrails, context size) pastes the raw transcript instead.
-                if let formatted = try? await TextFormatter.run(text, session: formatter) { text = formatted }
+                if let formatted = try? await TextFormatter.run(text, session: formatter, terms: terms) { text = formatted }
                 self?.formatting = false
             }
             let formattingSeconds = Date().timeIntervalSince(formattingStarted)
@@ -1464,6 +1466,12 @@ struct SettingsDialog: View {
                             Divider()
                             settingRow("Formattazione intelligente", subtitle: "Punteggiatura, grammatica, domande ed elenchi sistemati prima di incollare. " + TextFormatter.status) {
                                 Toggle("Formattazione", isOn: $model.formattingEnabled).labelsHidden().toggleStyle(.switch).controlSize(.small)
+                            }
+                            Divider()
+                            settingRow("Dizionario personale", subtitle: "Brand, nomi e termini tecnici separati da virgola. Migliorano riconoscimento e correzione (es. «AI» invece di «hai»).") {
+                                TextField("AI, Claude, Supermemory", text: $model.vocabulary)
+                                    .textFieldStyle(.roundedBorder).frame(width: 220)
+                                    .onSubmit { model.prepareModel() }
                             }
                             Divider()
                             settingRow("Stop automatico", subtitle: "Termina la registrazione dopo un periodo di silenzio.") {
