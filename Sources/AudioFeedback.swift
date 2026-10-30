@@ -20,6 +20,17 @@ struct RecordingWaveform: View {
     }
 }
 
+// The system ProgressView ignores tint on macOS and draws dark gray, invisible on the black notch.
+struct NotchSpinner: View {
+    var body: some View {
+        TimelineView(.animation) { context in
+            Circle().trim(from: 0, to: 0.72)
+                .stroke(.white, style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+                .rotationEffect(.degrees(context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 0.8) / 0.8 * 360))
+        }.frame(width: 16, height: 16)
+    }
+}
+
 // CoreAudio sound setup/playback can perform synchronous IPC when Bluetooth
 // changes mode. Keep all NSSound work off the application's main thread.
 final class SoundCue: @unchecked Sendable {

@@ -1171,9 +1171,9 @@ struct RecordingHUD: View {
                         Text("per registrare")
                     }.font(.system(size: 12))
                 } else if processing {
-                    ProgressView().controlSize(.small).tint(.white).accessibilityLabel("Elaborazione in corso")
+                    NotchSpinner().accessibilityLabel("Elaborazione in corso")
                 } else if model.isStarting {
-                    ProgressView().controlSize(.small).tint(.white)
+                    NotchSpinner()
                     Text("Avvio…").font(.system(size: 13, weight: .medium))
                 } else {
                     if listening {
