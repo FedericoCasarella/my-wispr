@@ -1120,8 +1120,10 @@ struct RecordingHUD: View {
     private let weights: [Double] = [0.35, 0.65, 0.9, 1, 0.8, 0.55, 0.3]
     @State private var hovered = false
     private var listening: Bool { model.phase == .recording }
-    private var expanded: Bool { hovered || listening || model.isStarting || model.holdHint != nil || model.notchNotice != nil }
-    private var notchWidth: CGFloat { model.holdHint != nil ? 350 : listening ? (model.buttonRecording ? 106 : 82) : 112 }
+    private var processing: Bool { model.phase == .finishing }
+    // The notch stays open at recording size while the transcript is finalized, formatted and pasted.
+    private var expanded: Bool { hovered || listening || processing || model.isStarting || model.holdHint != nil || model.notchNotice != nil }
+    private var notchWidth: CGFloat { model.holdHint != nil ? 350 : listening ? (model.buttonRecording ? 106 : 82) : processing ? 82 : 112 }
     var body: some View {
         ZStack(alignment: .bottom) {
             if model.showsClipboard {
@@ -1168,10 +1170,11 @@ struct RecordingHUD: View {
                         Text(shortcut).fontWeight(.semibold)
                         Text("per registrare")
                     }.font(.system(size: 12))
-                } else if model.phase == .finishing || model.isStarting {
+                } else if processing {
+                    ProgressView().controlSize(.small).tint(.white).accessibilityLabel("Elaborazione in corso")
+                } else if model.isStarting {
                     ProgressView().controlSize(.small).tint(.white)
-                    Text(model.isStarting ? "Avvio…" : model.formatting ? "Formatto…" : "Trascrivo…").font(.system(size: 13, weight: .medium))
-                        .contentTransition(.opacity).animation(.easeInOut(duration: 0.2), value: model.formatting)
+                    Text("Avvio…").font(.system(size: 13, weight: .medium))
                 } else {
                     if listening {
                         Image(systemName: "mic.fill").font(.system(size: 14, weight: .medium)).frame(width: 24, height: 24)
