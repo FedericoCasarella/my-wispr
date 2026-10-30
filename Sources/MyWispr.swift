@@ -3,6 +3,7 @@ import AppKit
 import AVFoundation
 import Speech
 import ServiceManagement
+import FoundationModels
 @preconcurrency import ApplicationServices
 
 struct Usage: Codable, Identifiable {
@@ -178,6 +179,9 @@ final class Dictation: ObservableObject {
     @Published var soundEnabled = UserDefaults.standard.object(forKey: "soundEnabled") as? Bool ?? true { didSet { UserDefaults.standard.set(soundEnabled, forKey: "soundEnabled") } }
     @Published var silenceSeconds = UserDefaults.standard.object(forKey: "silenceSeconds") as? Double ?? 10 { didSet { UserDefaults.standard.set(silenceSeconds, forKey: "silenceSeconds") } }
     @Published var capturingShortcut = false
+    @Published var formattingEnabled = UserDefaults.standard.object(forKey: "formattingEnabled") as? Bool ?? true { didSet { UserDefaults.standard.set(formattingEnabled, forKey: "formattingEnabled") } }
+    @Published private(set) var formatting = false
+    private var formatterSession: LanguageModelSession?
     @Published private(set) var launchAtLogin = false
     @Published private(set) var loginNeedsApproval = false
     @Published private(set) var loginError: String?
@@ -336,8 +340,9 @@ final class Dictation: ObservableObject {
         if capturingShortcut {
             let original = shortcut
             defer { if captureClipboardBinding, !capturingShortcut { clipboardBinding = shortcut; shortcut = original; captureClipboardBinding = false; if let data = try? JSONEncoder().encode(clipboardBinding) { UserDefaults.standard.set(data, forKey: "clipboardBinding") } } }
-            if event.type == .flagsChanged, [63, 61, 62, 60, 54].contains(event.keyCode), event.modifierFlags.contains(modifierFlag(for: event.keyCode)) {
-                let labels: [UInt16: String] = [63: "fn", 61: "⌥ destro", 62: "⌃ destro", 60: "⇧ destro", 54: "⌘ destro"]
+            // Left Control/Option are accepted too: most Mac keyboards have no right Control.
+            if event.type == .flagsChanged, [63, 59, 58, 61, 62, 60, 54].contains(event.keyCode), event.modifierFlags.contains(modifierFlag(for: event.keyCode)) {
+                let labels: [UInt16: String] = [63: "fn", 59: "⌃ control", 58: "⌥ sinistro", 61: "⌥ destro", 62: "⌃ destro", 60: "⇧ destro", 54: "⌘ destro"]
                 shortcut = ShortcutBinding(keyCode: event.keyCode, modifiers: 0, label: labels[event.keyCode] ?? "fn", isModifier: true)
                 capturingShortcut = false
             } else if event.type == .keyDown, !event.isARepeat {
@@ -470,6 +475,9 @@ final class Dictation: ObservableObject {
         target = NSWorkspace.shared.frontmostApplication
         focusedField = nil
         transcript = ""; committedText = ""
+        // Load the on-device model while the user speaks so formatting starts warm.
+        formatterSession = formattingEnabled && noteRecordingID == nil ? TextFormatter.session() : nil
+        formatterSession?.prewarm()
         let token = UUID(); session = token
         if let app = target {
             let captured = FocusApplication(app: app)
@@ -615,8 +623,10 @@ final class Dictation: ObservableObject {
     private func finish(token: UUID) {
         guard session == token, phase == .finishing, deliveringSession != token else { return }
         deliveringSession = token
-        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         let recognitionSeconds = Date().timeIntervalSince(stopped)
+        let formatter = formatterSession
+        formatterSession = nil
         deadline?.cancel(); deadline = nil
         resultsTask?.cancel(); resultsTask = nil; analyzer = nil; transcriber = nil
         if text.isEmpty || noteRecordingID != nil {
@@ -626,8 +636,17 @@ final class Dictation: ObservableObject {
         }
         let preparation = deliveryPreparation
         Task { @MainActor [weak self] in
+            let formattingStarted = Date()
+            if let formatter, text.split(whereSeparator: { $0.isWhitespace }).count > 2 {
+                self?.formatting = true; self?.message = "Sistemo il testo…"
+                // Any failure (timeout, guardrails, context size) pastes the raw transcript instead.
+                if let formatted = try? await TextFormatter.run(text, session: formatter) { text = formatted }
+                self?.formatting = false
+            }
+            let formattingSeconds = Date().timeIntervalSince(formattingStarted)
             let prepared = await preparation?.value
             guard let self, self.session == token, self.phase == .finishing else { return }
+            self.transcript = text
             let insertionStarted = Date()
             let inserted = self.insert(text, prepared: prepared)
             let totalSeconds = Date().timeIntervalSince(self.stopped)
@@ -636,7 +655,7 @@ final class Dictation: ObservableObject {
             if !inserted { self.showsCopyPreview = true; self.showCopyHUD?() }
             self.history.insert(Usage(date: Date(), words: text.split(whereSeparator: { $0.isWhitespace }).count, duration: self.stopped.timeIntervalSince(self.started), latency: totalSeconds, inserted: inserted, text: text), at: 0)
             self.deliveryPreparation = nil
-            let timings: [String: Double] = ["recognition_seconds": recognitionSeconds, "preparation_seconds": prepared?.preparationSeconds ?? 0, "insertion_seconds": Date().timeIntervalSince(insertionStarted), "release_to_paste_seconds": totalSeconds, "largest_ui_stall_seconds": self.responsiveness.largestDelay]
+            let timings: [String: Double] = ["recognition_seconds": recognitionSeconds, "formatting_seconds": formattingSeconds, "preparation_seconds": prepared?.preparationSeconds ?? 0, "insertion_seconds": Date().timeIntervalSince(insertionStarted), "release_to_paste_seconds": totalSeconds, "largest_ui_stall_seconds": self.responsiveness.largestDelay]
             self.message = self.insertionMessage
             let history = self.history, storage = self.storage
             // Encoding and atomically writing the full history is too slow for the UI thread.
@@ -657,7 +676,7 @@ final class Dictation: ObservableObject {
     private func abort(_ reason: String) {
         responsiveness.stop()
         deliveryPreparation?.cancel(); deliveryPreparation = nil
-        noteRecordingID = nil; notes.save()
+        noteRecordingID = nil; notes.save(); formatterSession = nil; formatting = false
         buttonRecording = false; isStarting = false
         session = UUID(); pendingStart?.cancel(); pendingStart = nil; deadline?.cancel(); stopAudio()
         continuation?.finish(); continuation = nil; resultsTask?.cancel(); resultsTask = nil
@@ -1149,7 +1168,8 @@ struct RecordingHUD: View {
                     }.font(.system(size: 12))
                 } else if model.phase == .finishing || model.isStarting {
                     ProgressView().controlSize(.small).tint(.white)
-                    Text(model.isStarting ? "Avvio…" : "Trascrivo…").font(.system(size: 13, weight: .medium))
+                    Text(model.isStarting ? "Avvio…" : model.formatting ? "Formatto…" : "Trascrivo…").font(.system(size: 13, weight: .medium))
+                        .contentTransition(.opacity).animation(.easeInOut(duration: 0.2), value: model.formatting)
                 } else {
                     if listening {
                         Image(systemName: "mic.fill").font(.system(size: 14, weight: .medium)).frame(width: 24, height: 24)
@@ -1423,7 +1443,7 @@ struct SettingsDialog: View {
                                 Toggle("Attiva", isOn: $model.shortcutEnabled).toggleStyle(.switch).controlSize(.small)
                             }
                             Divider()
-                            settingRow(model.capturingShortcut ? "Premi la nuova scorciatoia…" : "Tasto assegnato: \(model.shortcut.label)", subtitle: model.capturingShortcut ? "Fn, un modificatore destro o una combinazione. Esc per annullare." : "Fn + altri tasti resta disponibile per le funzioni del Mac.") {
+                            settingRow(model.capturingShortcut ? "Premi la nuova scorciatoia…" : "Tasto assegnato: \(model.shortcut.label)", subtitle: model.capturingShortcut ? "Fn, Control, un modificatore destro o una combinazione. Esc per annullare." : "Fn + altri tasti resta disponibile per le funzioni del Mac.") {
                                 Button(model.capturingShortcut ? "Annulla" : "Modifica") { model.capturingShortcut.toggle() }.buttonStyle(DashboardButtonStyle())
                             }
                             Divider()
@@ -1440,6 +1460,10 @@ struct SettingsDialog: View {
                             Divider()
                             settingRow("Suono di avvio", subtitle: "Riproduci il suono quando il microfono inizia a registrare.") {
                                 Toggle("Suono", isOn: $model.soundEnabled).labelsHidden().toggleStyle(.switch).controlSize(.small)
+                            }
+                            Divider()
+                            settingRow("Formattazione intelligente", subtitle: "Punteggiatura, grammatica, domande ed elenchi sistemati prima di incollare. " + TextFormatter.status) {
+                                Toggle("Formattazione", isOn: $model.formattingEnabled).labelsHidden().toggleStyle(.switch).controlSize(.small)
                             }
                             Divider()
                             settingRow("Stop automatico", subtitle: "Termina la registrazione dopo un periodo di silenzio.") {
